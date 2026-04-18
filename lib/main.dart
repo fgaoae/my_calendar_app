@@ -77,72 +77,446 @@ class CalendarViewWidget extends StatefulWidget {
 
 class _CalendarViewWidgetState extends State<CalendarViewWidget> {
   late final _EventDataSource _dataSource;
-  late final StreamSubscription<List<Map<String, dynamic>>> _subscription;
+  late final StreamSubscription<List<Map<String, dynamic>>> _eventSub;
+  late final StreamSubscription<List<Map<String, dynamic>>> _dbSub;
+  final CalendarController _calendarController = CalendarController();
+
+  List<Map<String, dynamic>> _allEvents = [];
+  List<Map<String, dynamic>> _allDbs = [];
+  String? _selectedDbId;
+  bool _loading = true;
 
   @override
   void initState() {
     super.initState();
+
+    _calendarController.view = CalendarView.week;
+    _calendarController.displayDate = DateTime.now();
+
     _dataSource = _EventDataSource([]);
-    _subscription = widget.eventStream.listen((data) {
-      final List<Appointment> appointments = [];
-      for (final item in data) {
-        if (item['start_time'] == null) continue;
-        try {
-          final startTime = DateTime.parse(item['start_time'].toString()).toLocal();
-          final endTime = item['end_time'] != null
-              ? DateTime.parse(item['end_time'].toString()).toLocal()
-              : startTime.add(const Duration(hours: 1));
 
-          final props = (item['properties'] ?? {}) as Map<String, dynamic>;
-          final rrule = item['is_recurring'] == true ? props['_sys_rrule']?.toString() : null;
+    _eventSub = widget.eventStream.listen((data) {
+      _allEvents = data;
+      _rebuildAppointments();
+    });
 
-          appointments.add(Appointment(
-            id: item['id'],
-            startTime: startTime,
-            endTime: endTime,
-            subject: item['title']?.toString() ?? '无标题',
-            notes: item['description']?.toString(),
-            color: Colors.deepPurpleAccent,
-            recurrenceRule: rrule,
-          ));
-        } catch (_) {}
+    _dbSub = Supabase.instance.client
+        .from('databases')
+        .stream(primaryKey: ['id'])
+        .listen((data) {
+      _allDbs = data;
+      if (_allDbs.isNotEmpty) {
+        final valid = _allDbs.any((d) => d['id'].toString() == _selectedDbId);
+        if (!valid) _selectedDbId = null; // 默认全部
+      } else {
+        _selectedDbId = null;
       }
-      _dataSource.updateAppointments(appointments);
+      if (mounted) setState(() => _loading = false);
+      _rebuildAppointments();
     });
   }
 
   @override
   void dispose() {
-    _subscription.cancel();
+    _eventSub.cancel();
+    _dbSub.cancel();
+    _calendarController.dispose();
     super.dispose();
   }
 
-  Future<void> _updateEventTime(dynamic id, DateTime newStartTime) async {
-    await Supabase.instance.client.from('events').update({
-      'start_time': newStartTime.toUtc().toIso8601String(),
-      'end_time': newStartTime.add(const Duration(hours: 1)).toUtc().toIso8601String(),
-    }).eq('id', id);
+  List<Map<String, dynamic>> get _filteredEvents {
+    if (_selectedDbId == null) return _allEvents;
+    return _allEvents.where((e) => e['database_id']?.toString() == _selectedDbId).toList();
+  }
+
+  List<Map<String, dynamic>> get _unscheduledEvents {
+    return _filteredEvents.where((e) => e['start_time'] == null).toList();
+  }
+
+  void _rebuildAppointments() {
+    final List<Appointment> list = [];
+    for (final item in _filteredEvents) {
+      if (item['start_time'] == null) continue; // 未排期不进网格
+      try {
+        final start = DateTime.parse(item['start_time'].toString()).toLocal();
+        final end = item['end_time'] != null
+            ? DateTime.parse(item['end_time'].toString()).toLocal()
+            : start.add(const Duration(hours: 1));
+
+        final props = Map<String, dynamic>.from(item['properties'] ?? {});
+        final rrule = item['is_recurring'] == true ? props['_sys_rrule']?.toString() : null;
+
+        list.add(
+          Appointment(
+            id: item['id'],
+            startTime: start,
+            endTime: end,
+            subject: (item['title'] ?? '未命名').toString(),
+            notes: (item['description'] ?? '').toString(),
+            color: Colors.deepPurpleAccent,
+            recurrenceRule: rrule,
+          ),
+        );
+      } catch (_) {}
+    }
+
+    _dataSource.updateAppointments(list);
+    if (mounted) setState(() {});
+  }
+
+  String _dbName(String? id) {
+    if (id == null) return '全部数据库';
+    final found = _allDbs.where((d) => d['id'].toString() == id);
+    if (found.isEmpty) return '未知数据库';
+    return found.first['name']?.toString() ?? '未命名';
+  }
+
+  Future<void> _moveAppointment(Appointment app, DateTime newStart) async {
+  final dynamic id = app.id;
+  if (id == null) return;
+
+  final duration = app.endTime.difference(app.startTime);
+  final newEnd = newStart.add(duration);
+
+  await Supabase.instance.client.from('events').update({
+    'start_time': newStart.toUtc().toIso8601String(),
+    'end_time': newEnd.toUtc().toIso8601String(),
+  }).eq('id', id.toString());
+}
+
+Future<void> _resizeAppointment(Appointment app, DateTime newStart, DateTime newEnd) async {
+  final dynamic id = app.id;
+  if (id == null) return;
+
+  await Supabase.instance.client.from('events').update({
+    'start_time': newStart.toUtc().toIso8601String(),
+    'end_time': newEnd.toUtc().toIso8601String(),
+  }).eq('id', id.toString());
+}
+
+  Future<void> _createQuickAt(DateTime start, DateTime end) async {
+    await Supabase.instance.client.from('events').insert({
+      'database_id': _selectedDbId,
+      'title': '新日程',
+      'description': '',
+      'start_time': start.toUtc().toIso8601String(),
+      'end_time': end.toUtc().toIso8601String(),
+      'is_recurring': false,
+      'properties': {},
+      'sort_order': 0,
+    });
+  }
+
+  Future<void> _editEventDialog(Map<String, dynamic>? row, {DateTime? defaultStart, DateTime? defaultEnd}) async {
+    final titleCtrl = TextEditingController(text: row?['title']?.toString() ?? '');
+    final descCtrl = TextEditingController(text: row?['description']?.toString() ?? '');
+
+    DateTime? start = row?['start_time'] != null
+        ? DateTime.parse(row!['start_time']).toLocal()
+        : defaultStart;
+    DateTime? end = row?['end_time'] != null
+        ? DateTime.parse(row!['end_time']).toLocal()
+        : defaultEnd;
+
+    final props = Map<String, dynamic>.from(row?['properties'] ?? {});
+    bool recurring = row?['is_recurring'] == true;
+
+    Future<DateTime?> pickDateTime(DateTime? init) async {
+      final d = await showDatePicker(
+        context: context,
+        initialDate: init ?? DateTime.now(),
+        firstDate: DateTime(2000),
+        lastDate: DateTime(2100),
+      );
+      if (d == null) return null;
+      final t = await showTimePicker(
+        context: context,
+        initialTime: TimeOfDay.fromDateTime(init ?? DateTime.now()),
+      );
+      if (t == null) return null;
+      return DateTime(d.year, d.month, d.day, t.hour, t.minute);
+    }
+
+    await showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (_, setD) => AlertDialog(
+          title: Text(row == null ? '新建日程' : '编辑日程'),
+          content: SingleChildScrollView(
+            child: Column(
+              children: [
+                TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: '标题')),
+                TextField(controller: descCtrl, decoration: const InputDecoration(labelText: '描述')),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: () async {
+                    final dt = await pickDateTime(start);
+                    if (dt != null) setD(() => start = dt);
+                  },
+                  child: Text(start == null ? '开始时间' : '开始: ${start.toString().substring(0, 16)}'),
+                ),
+                OutlinedButton(
+                  onPressed: () async {
+                    final dt = await pickDateTime(end ?? start);
+                    if (dt != null) setD(() => end = dt);
+                  },
+                  child: Text(end == null ? '结束时间' : '结束: ${end.toString().substring(0, 16)}'),
+                ),
+                SwitchListTile(
+                  value: recurring,
+                  onChanged: (v) => setD(() => recurring = v),
+                  title: const Text('重复'),
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
+            if (row != null)
+              TextButton(
+                onPressed: () async {
+                  await Supabase.instance.client.from('events').delete().eq('id', row['id']);
+                  if (!mounted) return;
+                  Navigator.pop(context);
+                },
+                child: const Text('删除', style: TextStyle(color: Colors.red)),
+              ),
+            ElevatedButton(
+              onPressed: () async {
+                final title = titleCtrl.text.trim();
+                if (title.isEmpty) return;
+
+                final payload = {
+                  'database_id': row?['database_id'] ?? _selectedDbId,
+                  'title': title,
+                  'description': descCtrl.text.trim(),
+                  'start_time': start?.toUtc().toIso8601String(),
+                  'end_time': end?.toUtc().toIso8601String(),
+                  'is_recurring': recurring,
+                  'properties': props,
+                };
+
+                if (row == null) {
+                  await Supabase.instance.client.from('events').insert(payload);
+                } else {
+                  await Supabase.instance.client.from('events').update(payload).eq('id', row['id']);
+                }
+
+                if (!mounted) return;
+                Navigator.pop(context);
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopBar() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      color: Colors.grey.shade50,
+      child: Row(
+        children: [
+          IconButton(
+            onPressed: () {
+              final d = _calendarController.displayDate ?? DateTime.now();
+              switch (_calendarController.view) {
+                case CalendarView.month:
+                  _calendarController.displayDate = DateTime(d.year, d.month - 1, d.day);
+                  break;
+                case CalendarView.day:
+                case CalendarView.workWeek:
+                case CalendarView.week:
+                case CalendarView.timelineDay:
+                case CalendarView.timelineWeek:
+                case CalendarView.timelineWorkWeek:
+                case CalendarView.schedule:
+                case CalendarView.timelineMonth:
+                  _calendarController.displayDate = d.subtract(const Duration(days: 7));
+                  break;
+                default:
+                  _calendarController.displayDate = d.subtract(const Duration(days: 7));
+              }
+              setState(() {});
+            },
+            icon: const Icon(Icons.chevron_left),
+          ),
+          IconButton(
+            onPressed: () {
+              _calendarController.displayDate = DateTime.now();
+              setState(() {});
+            },
+            icon: const Icon(Icons.today),
+            tooltip: '今天',
+          ),
+          IconButton(
+            onPressed: () {
+              final d = _calendarController.displayDate ?? DateTime.now();
+              switch (_calendarController.view) {
+                case CalendarView.month:
+                  _calendarController.displayDate = DateTime(d.year, d.month + 1, d.day);
+                  break;
+                default:
+                  _calendarController.displayDate = d.add(const Duration(days: 7));
+              }
+              setState(() {});
+            },
+            icon: const Icon(Icons.chevron_right),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              _calendarController.displayDate?.toString().substring(0, 10) ?? '',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          DropdownButton<CalendarView>(
+            value: _calendarController.view,
+            items: const [
+              DropdownMenuItem(value: CalendarView.month, child: Text('月')),
+              DropdownMenuItem(value: CalendarView.week, child: Text('周')),
+              DropdownMenuItem(value: CalendarView.day, child: Text('日')),
+              DropdownMenuItem(value: CalendarView.timelineWeek, child: Text('时间线')),
+            ],
+            onChanged: (v) {
+              if (v == null) return;
+              setState(() => _calendarController.view = v);
+            },
+          ),
+          const SizedBox(width: 12),
+          DropdownButton<String?>(
+            value: _selectedDbId,
+            hint: const Text('全部数据库'),
+            items: [
+              const DropdownMenuItem<String?>(value: null, child: Text('全部数据库')),
+              ..._allDbs.map((d) => DropdownMenuItem<String?>(
+                    value: d['id'].toString(),
+                    child: Text(d['name']?.toString() ?? '未命名'),
+                  )),
+            ],
+            onChanged: (v) {
+              setState(() => _selectedDbId = v);
+              _rebuildAppointments();
+            },
+          ),
+          const SizedBox(width: 8),
+          ElevatedButton.icon(
+            onPressed: () => _editEventDialog(null),
+            icon: const Icon(Icons.add),
+            label: const Text('新建'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildUnscheduledPanel() {
+    final list = _unscheduledEvents;
+    if (list.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      width: 280,
+      decoration: BoxDecoration(
+        border: Border(left: BorderSide(color: Colors.grey.shade300)),
+        color: Colors.white,
+      ),
+      child: Column(
+        children: [
+          Container(
+            height: 48,
+            alignment: Alignment.centerLeft,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Text(
+              '未排期 (${list.length})',
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView.builder(
+              itemCount: list.length,
+              itemBuilder: (_, i) {
+                final e = list[i];
+                return ListTile(
+                  dense: true,
+                  title: Text(e['title']?.toString() ?? '未命名'),
+                  subtitle: Text(_dbName(e['database_id']?.toString())),
+                  onTap: () => _editEventDialog(e),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
     return Scaffold(
-      appBar: AppBar(title: const Text('我的 Notion 日历')),
-      body: SfCalendar(
-        view: CalendarView.week,
-        dataSource: _dataSource,
-        allowDragAndDrop: true,
-        onDragEnd: (details) {
-          final app = details.appointment;
-          if (app is Appointment && details.droppingTime != null) {
-            _updateEventTime(app.id, details.droppingTime!);
-          }
-        },
+      appBar: AppBar(title: const Text('日程')),
+      body: Column(
+        children: [
+          _buildTopBar(),
+          Expanded(
+            child: Row(
+              children: [
+                Expanded(
+                  child: SfCalendar(
+                    controller: _calendarController,
+                    dataSource: _dataSource,
+                    allowDragAndDrop: true,
+                    allowAppointmentResize: true,
+                    onTap: (details) {
+                      if (details.targetElement == CalendarElement.calendarCell &&
+                          details.date != null) {
+                        final s = details.date!;
+                        final e = s.add(const Duration(hours: 1));
+                        _createQuickAt(s, e);
+                        return;
+                      }
+
+                      if (details.appointments != null && details.appointments!.isNotEmpty) {
+                        final app = details.appointments!.first;
+                        if (app is Appointment) {
+                          final raw = _filteredEvents.where((x) => x['id'] == app.id).toList();
+                          if (raw.isNotEmpty) _editEventDialog(raw.first);
+                        }
+                      }
+                    },
+                    onDragEnd: (details) {
+                      final app = details.appointment;
+                      if (app is Appointment && details.droppingTime != null) {
+                        _moveAppointment(app, details.droppingTime!);
+                      }
+                    },
+                    onAppointmentResizeEnd: (details) {
+                      final app = details.appointment;
+                      if (app is Appointment &&
+                          details.startTime != null &&
+                          details.endTime != null) {
+                        _resizeAppointment(app, details.startTime!, details.endTime!);
+                      }
+                    },
+                  ),
+                ),
+                _buildUnscheduledPanel(),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
 }
-
 // ============ 数据库视图（满足7条需求） ============
 class DatabaseViewWidget extends StatefulWidget {
   final Stream<List<Map<String, dynamic>>> eventStream;
