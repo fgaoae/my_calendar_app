@@ -618,7 +618,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                                 ),
                               ),
                             ),
-                        ],
+                        ], 
                       );
                     },
                   ),
