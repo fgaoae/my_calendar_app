@@ -76,15 +76,22 @@ class CalendarViewWidget extends StatefulWidget {
 }
 
 class _CalendarViewWidgetState extends State<CalendarViewWidget> {
-  late final _EventDataSource _dataSource;
+  late final CalendarEventDataSource _dataSource;
   late final StreamSubscription<List<Map<String, dynamic>>> _eventSub;
   late final StreamSubscription<List<Map<String, dynamic>>> _dbSub;
   final CalendarController _calendarController = CalendarController();
+  final GlobalKey _calendarKey = GlobalKey();
 
   List<Map<String, dynamic>> _allEvents = [];
   List<Map<String, dynamic>> _allDbs = [];
   String? _selectedDbId;
   bool _loading = true;
+
+  bool _calendarHoveringDrag = false;
+  final Duration _defaultDropDuration = const Duration(hours: 1);
+
+  // 关键：实时记录拖拽指针全局坐标
+  Offset? _lastGlobalDragPointer;
 
   @override
   void initState() {
@@ -92,8 +99,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
 
     _calendarController.view = CalendarView.week;
     _calendarController.displayDate = DateTime.now();
-
-    _dataSource = _EventDataSource([]);
+    _dataSource = CalendarEventDataSource(const <Appointment>[]);
 
     _eventSub = widget.eventStream.listen((data) {
       _allEvents = data;
@@ -104,16 +110,19 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
         .from('databases')
         .stream(primaryKey: ['id'])
         .listen((data) {
-      _allDbs = data;
+      _allDbs = List<Map<String, dynamic>>.from(data);
       if (_allDbs.isNotEmpty) {
         final valid = _allDbs.any((d) => d['id'].toString() == _selectedDbId);
-        if (!valid) _selectedDbId = null; // 默认全部
+        if (!valid) _selectedDbId = null;
       } else {
         _selectedDbId = null;
       }
-      if (mounted) setState(() => _loading = false);
+      if (!mounted) return;
+      setState(() => _loading = false);
       _rebuildAppointments();
     });
+
+    _hardRefreshEvents();
   }
 
   @override
@@ -124,19 +133,25 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
     super.dispose();
   }
 
+  Future<void> _hardRefreshEvents() async {
+    final fresh = await Supabase.instance.client.from('events').select().order('sort_order');
+    _allEvents = List<Map<String, dynamic>>.from(fresh);
+    _rebuildAppointments();
+  }
+
   List<Map<String, dynamic>> get _filteredEvents {
     if (_selectedDbId == null) return _allEvents;
     return _allEvents.where((e) => e['database_id']?.toString() == _selectedDbId).toList();
   }
 
-  List<Map<String, dynamic>> get _unscheduledEvents {
-    return _filteredEvents.where((e) => e['start_time'] == null).toList();
+  List<Map<String, dynamic>> _eventsByDb(String dbId) {
+    return _allEvents.where((e) => e['database_id']?.toString() == dbId).toList();
   }
 
   void _rebuildAppointments() {
     final List<Appointment> list = [];
     for (final item in _filteredEvents) {
-      if (item['start_time'] == null) continue; // 未排期不进网格
+      if (item['start_time'] == null) continue;
       try {
         final start = DateTime.parse(item['start_time'].toString()).toLocal();
         final end = item['end_time'] != null
@@ -159,158 +174,292 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
         );
       } catch (_) {}
     }
-
     _dataSource.updateAppointments(list);
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
   }
 
-  String _dbName(String? id) {
-    if (id == null) return '全部数据库';
-    final found = _allDbs.where((d) => d['id'].toString() == id);
-    if (found.isEmpty) return '未知数据库';
-    return found.first['name']?.toString() ?? '未命名';
+  DateTime _roundToNearest30(DateTime dt) {
+    final m = dt.minute;
+    if (m < 15) return DateTime(dt.year, dt.month, dt.day, dt.hour, 0);
+    if (m < 45) return DateTime(dt.year, dt.month, dt.day, dt.hour, 30);
+    return DateTime(dt.year, dt.month, dt.day, dt.hour + 1, 0);
+  }
+
+  DateTime? _resolveDropTimeFromOffset(Offset globalOffset) {
+    try {
+      final ctx = _calendarKey.currentContext;
+      if (ctx == null) return null;
+
+      final rb = ctx.findRenderObject();
+      if (rb is! RenderBox) return null;
+
+      final localOffset = rb.globalToLocal(globalOffset);
+
+      final dynamic state = _calendarKey.currentState;
+      if (state == null) return null;
+
+      final dynamic details = state.getCalendarDetailsAtOffset(localOffset);
+      final dynamic dt = details?.date;
+      if (dt is! DateTime) return null;
+
+      return _roundToNearest30(dt);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _scheduleExternalDropByOffset(
+    Map<String, dynamic> eventRow,
+    Offset globalOffset,
+  ) async {
+    final resolved = _resolveDropTimeFromOffset(globalOffset);
+    final start = resolved ??
+        (() {
+          final d = _calendarController.displayDate ?? DateTime.now();
+          return DateTime(d.year, d.month, d.day, 9, 0);
+        })();
+
+    final oldStart = eventRow['start_time'] != null
+        ? DateTime.tryParse(eventRow['start_time'].toString())?.toLocal()
+        : null;
+    final oldEnd = eventRow['end_time'] != null
+        ? DateTime.tryParse(eventRow['end_time'].toString())?.toLocal()
+        : null;
+
+    Duration duration = _defaultDropDuration;
+    if (oldStart != null && oldEnd != null && oldEnd.isAfter(oldStart)) {
+      duration = oldEnd.difference(oldStart);
+    }
+
+    final end = start.add(duration);
+
+    await Supabase.instance.client.from('events').update({
+      'start_time': start.toUtc().toIso8601String(),
+      'end_time': end.toUtc().toIso8601String(),
+    }).eq('id', eventRow['id']);
+
+    await _hardRefreshEvents();
   }
 
   Future<void> _moveAppointment(Appointment app, DateTime newStart) async {
-  final dynamic id = app.id;
-  if (id == null) return;
+    final dynamic id = app.id;
+    if (id == null) return;
 
-  final duration = app.endTime.difference(app.startTime);
-  final newEnd = newStart.add(duration);
+    final duration = app.endTime.difference(app.startTime);
+    final newEnd = newStart.add(duration);
 
-  await Supabase.instance.client.from('events').update({
-    'start_time': newStart.toUtc().toIso8601String(),
-    'end_time': newEnd.toUtc().toIso8601String(),
-  }).eq('id', id.toString());
-}
+    await Supabase.instance.client.from('events').update({
+      'start_time': newStart.toUtc().toIso8601String(),
+      'end_time': newEnd.toUtc().toIso8601String(),
+    }).eq('id', id.toString());
 
-Future<void> _resizeAppointment(Appointment app, DateTime newStart, DateTime newEnd) async {
-  final dynamic id = app.id;
-  if (id == null) return;
-
-  await Supabase.instance.client.from('events').update({
-    'start_time': newStart.toUtc().toIso8601String(),
-    'end_time': newEnd.toUtc().toIso8601String(),
-  }).eq('id', id.toString());
-}
-
-  Future<void> _createQuickAt(DateTime start, DateTime end) async {
-    await Supabase.instance.client.from('events').insert({
-      'database_id': _selectedDbId,
-      'title': '新日程',
-      'description': '',
-      'start_time': start.toUtc().toIso8601String(),
-      'end_time': end.toUtc().toIso8601String(),
-      'is_recurring': false,
-      'properties': {},
-      'sort_order': 0,
-    });
+    await _hardRefreshEvents();
   }
 
-  Future<void> _editEventDialog(Map<String, dynamic>? row, {DateTime? defaultStart, DateTime? defaultEnd}) async {
-    final titleCtrl = TextEditingController(text: row?['title']?.toString() ?? '');
-    final descCtrl = TextEditingController(text: row?['description']?.toString() ?? '');
+  Future<void> _resizeAppointment(Appointment app, DateTime newStart, DateTime newEnd) async {
+    final dynamic id = app.id;
+    if (id == null) return;
 
-    DateTime? start = row?['start_time'] != null
-        ? DateTime.parse(row!['start_time']).toLocal()
-        : defaultStart;
-    DateTime? end = row?['end_time'] != null
-        ? DateTime.parse(row!['end_time']).toLocal()
-        : defaultEnd;
+    await Supabase.instance.client.from('events').update({
+      'start_time': newStart.toUtc().toIso8601String(),
+      'end_time': newEnd.toUtc().toIso8601String(),
+    }).eq('id', id.toString());
 
-    final props = Map<String, dynamic>.from(row?['properties'] ?? {});
-    bool recurring = row?['is_recurring'] == true;
+    await _hardRefreshEvents();
+  }
 
-    Future<DateTime?> pickDateTime(DateTime? init) async {
-      final d = await showDatePicker(
-        context: context,
-        initialDate: init ?? DateTime.now(),
-        firstDate: DateTime(2000),
-        lastDate: DateTime(2100),
-      );
-      if (d == null) return null;
-      final t = await showTimePicker(
-        context: context,
-        initialTime: TimeOfDay.fromDateTime(init ?? DateTime.now()),
-      );
-      if (t == null) return null;
-      return DateTime(d.year, d.month, d.day, t.hour, t.minute);
-    }
+  Future<void> _editEventDialog(Map<String, dynamic> row) async {
+    final titleCtrl = TextEditingController(text: row['title']?.toString() ?? '');
+    final descCtrl = TextEditingController(text: row['description']?.toString() ?? '');
+    final props = Map<String, dynamic>.from(row['properties'] ?? {});
+    final propControllers = <String, TextEditingController>{
+      for (final e in props.entries) e.key: TextEditingController(text: '${e.value ?? ''}')
+    };
 
     await showDialog(
       context: context,
-      builder: (_) => StatefulBuilder(
-        builder: (_, setD) => AlertDialog(
-          title: Text(row == null ? '新建日程' : '编辑日程'),
-          content: SingleChildScrollView(
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('编辑日程'),
+        content: SizedBox(
+          width: 540,
+          child: SingleChildScrollView(
             child: Column(
               children: [
                 TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: '标题')),
                 TextField(controller: descCtrl, decoration: const InputDecoration(labelText: '描述')),
                 const SizedBox(height: 8),
-                OutlinedButton(
-                  onPressed: () async {
-                    final dt = await pickDateTime(start);
-                    if (dt != null) setD(() => start = dt);
-                  },
-                  child: Text(start == null ? '开始时间' : '开始: ${start.toString().substring(0, 16)}'),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('属性（properties）', style: TextStyle(color: Colors.grey.shade700)),
                 ),
-                OutlinedButton(
-                  onPressed: () async {
-                    final dt = await pickDateTime(end ?? start);
-                    if (dt != null) setD(() => end = dt);
-                  },
-                  child: Text(end == null ? '结束时间' : '结束: ${end.toString().substring(0, 16)}'),
-                ),
-                SwitchListTile(
-                  value: recurring,
-                  onChanged: (v) => setD(() => recurring = v),
-                  title: const Text('重复'),
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                ),
+                const SizedBox(height: 6),
+                if (propControllers.isEmpty)
+                  const Align(alignment: Alignment.centerLeft, child: Text('无属性')),
+                ...propControllers.entries.map((entry) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(
+                        children: [
+                          SizedBox(width: 150, child: Text(entry.key, overflow: TextOverflow.ellipsis)),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: TextField(
+                              controller: entry.value,
+                              decoration: const InputDecoration(
+                                isDense: true,
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )),
               ],
             ),
           ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
-            if (row != null)
-              TextButton(
-                onPressed: () async {
-                  await Supabase.instance.client.from('events').delete().eq('id', row['id']);
-                  if (!mounted) return;
-                  Navigator.pop(context);
-                },
-                child: const Text('删除', style: TextStyle(color: Colors.red)),
-              ),
-            ElevatedButton(
-              onPressed: () async {
-                final title = titleCtrl.text.trim();
-                if (title.isEmpty) return;
-
-                final payload = {
-                  'database_id': row?['database_id'] ?? _selectedDbId,
-                  'title': title,
-                  'description': descCtrl.text.trim(),
-                  'start_time': start?.toUtc().toIso8601String(),
-                  'end_time': end?.toUtc().toIso8601String(),
-                  'is_recurring': recurring,
-                  'properties': props,
-                };
-
-                if (row == null) {
-                  await Supabase.instance.client.from('events').insert(payload);
-                } else {
-                  await Supabase.instance.client.from('events').update(payload).eq('id', row['id']);
-                }
-
-                if (!mounted) return;
-                Navigator.pop(context);
-              },
-              child: const Text('保存'),
-            ),
-          ],
         ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('取消')),
+          ElevatedButton(
+            onPressed: () async {
+              final newProps = <String, dynamic>{};
+              for (final e in propControllers.entries) {
+                final v = e.value.text.trim();
+                if (v.isNotEmpty) newProps[e.key] = v;
+              }
+              await Supabase.instance.client.from('events').update({
+                'title': titleCtrl.text.trim(),
+                'description': descCtrl.text.trim(),
+                'properties': newProps,
+              }).eq('id', row['id']);
+
+              if (!mounted) return;
+              Navigator.pop(dialogContext);
+              await _hardRefreshEvents();
+            },
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDragHandle(Map<String, dynamic> e) {
+    final title = e['title']?.toString() ?? '未命名';
+    return Draggable<Map<String, dynamic>>(
+      data: e,
+      feedback: Material(
+        color: Colors.transparent,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 120),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.deepPurple.withValues(alpha: 0.9),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Colors.white, fontSize: 12),
+          ),
+        ),
+      ),
+      onDragStarted: () {
+        if (!mounted) return;
+        setState(() {
+          _calendarHoveringDrag = true;
+          _lastGlobalDragPointer = null;
+        });
+      },
+      onDragUpdate: (details) {
+        _lastGlobalDragPointer = details.globalPosition;
+      },
+      onDragEnd: (_) {
+        if (!mounted) return;
+        setState(() => _calendarHoveringDrag = false);
+      },
+      child: const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 6),
+        child: Icon(Icons.drag_indicator, size: 18),
+      ),
+    );
+  }
+
+  Widget _buildLeftDatabaseWithData() {
+    return Container(
+      width: 320,
+      decoration: BoxDecoration(
+        color: Colors.grey.shade50,
+        border: Border(right: BorderSide(color: Colors.grey.shade300)),
+      ),
+      child: Column(
+        children: [
+          const SizedBox(height: 8),
+          ListTile(
+            dense: true,
+            selected: _selectedDbId == null,
+            title: const Text('全部数据库'),
+            onTap: () {
+              setState(() => _selectedDbId = null);
+              _rebuildAppointments();
+            },
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView(
+              children: _allDbs.map((db) {
+                final dbId = db['id'].toString();
+                final dbName = db['name']?.toString() ?? '未命名数据库';
+                final rows = _eventsByDb(dbId);
+
+                return ExpansionTile(
+                  initiallyExpanded: _selectedDbId == dbId,
+                  title: InkWell(
+                    onTap: () {
+                      setState(() => _selectedDbId = dbId);
+                      _rebuildAppointments();
+                    },
+                    child: Container(
+                      color: _selectedDbId == dbId ? Colors.deepPurple.withValues(alpha: 0.08) : null,
+                      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 6),
+                      child: Text(dbName, style: const TextStyle(fontWeight: FontWeight.w600)),
+                    ),
+                  ),
+                  subtitle: Text('${rows.length} 条'),
+                  children: rows.map((e) {
+                    final title = e['title']?.toString() ?? '未命名';
+                    final sub = e['start_time'] == null
+                        ? '未排期'
+                        : DateTime.parse(e['start_time']).toLocal().toString().substring(0, 16);
+
+                    return Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        border: Border.all(color: Colors.grey.shade200),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: ListTile(
+                              dense: true,
+                              title: Text(title, overflow: TextOverflow.ellipsis),
+                              subtitle: Text(sub),
+                              onTap: () => _editEventDialog(e),
+                            ),
+                          ),
+                          _buildDragHandle(e),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                );
+              }).toList(),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -322,50 +471,31 @@ Future<void> _resizeAppointment(Appointment app, DateTime newStart, DateTime new
       child: Row(
         children: [
           IconButton(
+            icon: const Icon(Icons.chevron_left),
             onPressed: () {
               final d = _calendarController.displayDate ?? DateTime.now();
-              switch (_calendarController.view) {
-                case CalendarView.month:
-                  _calendarController.displayDate = DateTime(d.year, d.month - 1, d.day);
-                  break;
-                case CalendarView.day:
-                case CalendarView.workWeek:
-                case CalendarView.week:
-                case CalendarView.timelineDay:
-                case CalendarView.timelineWeek:
-                case CalendarView.timelineWorkWeek:
-                case CalendarView.schedule:
-                case CalendarView.timelineMonth:
-                  _calendarController.displayDate = d.subtract(const Duration(days: 7));
-                  break;
-                default:
-                  _calendarController.displayDate = d.subtract(const Duration(days: 7));
-              }
+              _calendarController.displayDate = _calendarController.view == CalendarView.month
+                  ? DateTime(d.year, d.month - 1, d.day)
+                  : d.subtract(const Duration(days: 7));
               setState(() {});
             },
-            icon: const Icon(Icons.chevron_left),
           ),
           IconButton(
+            icon: const Icon(Icons.today),
             onPressed: () {
               _calendarController.displayDate = DateTime.now();
               setState(() {});
             },
-            icon: const Icon(Icons.today),
-            tooltip: '今天',
           ),
           IconButton(
+            icon: const Icon(Icons.chevron_right),
             onPressed: () {
               final d = _calendarController.displayDate ?? DateTime.now();
-              switch (_calendarController.view) {
-                case CalendarView.month:
-                  _calendarController.displayDate = DateTime(d.year, d.month + 1, d.day);
-                  break;
-                default:
-                  _calendarController.displayDate = d.add(const Duration(days: 7));
-              }
+              _calendarController.displayDate = _calendarController.view == CalendarView.month
+                  ? DateTime(d.year, d.month + 1, d.day)
+                  : d.add(const Duration(days: 7));
               setState(() {});
             },
-            icon: const Icon(Icons.chevron_right),
           ),
           const SizedBox(width: 8),
           Expanded(
@@ -387,69 +517,6 @@ Future<void> _resizeAppointment(Appointment app, DateTime newStart, DateTime new
               setState(() => _calendarController.view = v);
             },
           ),
-          const SizedBox(width: 12),
-          DropdownButton<String?>(
-            value: _selectedDbId,
-            hint: const Text('全部数据库'),
-            items: [
-              const DropdownMenuItem<String?>(value: null, child: Text('全部数据库')),
-              ..._allDbs.map((d) => DropdownMenuItem<String?>(
-                    value: d['id'].toString(),
-                    child: Text(d['name']?.toString() ?? '未命名'),
-                  )),
-            ],
-            onChanged: (v) {
-              setState(() => _selectedDbId = v);
-              _rebuildAppointments();
-            },
-          ),
-          const SizedBox(width: 8),
-          ElevatedButton.icon(
-            onPressed: () => _editEventDialog(null),
-            icon: const Icon(Icons.add),
-            label: const Text('新建'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildUnscheduledPanel() {
-    final list = _unscheduledEvents;
-    if (list.isEmpty) return const SizedBox.shrink();
-
-    return Container(
-      width: 280,
-      decoration: BoxDecoration(
-        border: Border(left: BorderSide(color: Colors.grey.shade300)),
-        color: Colors.white,
-      ),
-      child: Column(
-        children: [
-          Container(
-            height: 48,
-            alignment: Alignment.centerLeft,
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Text(
-              '未排期 (${list.length})',
-              style: const TextStyle(fontWeight: FontWeight.w700),
-            ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: ListView.builder(
-              itemCount: list.length,
-              itemBuilder: (_, i) {
-                final e = list[i];
-                return ListTile(
-                  dense: true,
-                  title: Text(e['title']?.toString() ?? '未命名'),
-                  subtitle: Text(_dbName(e['database_id']?.toString())),
-                  onTap: () => _editEventDialog(e),
-                );
-              },
-            ),
-          ),
         ],
       ),
     );
@@ -469,52 +536,110 @@ Future<void> _resizeAppointment(Appointment app, DateTime newStart, DateTime new
           Expanded(
             child: Row(
               children: [
+                _buildLeftDatabaseWithData(),
                 Expanded(
-                  child: SfCalendar(
-                    controller: _calendarController,
-                    dataSource: _dataSource,
-                    allowDragAndDrop: true,
-                    allowAppointmentResize: true,
-                    onTap: (details) {
-                      if (details.targetElement == CalendarElement.calendarCell &&
-                          details.date != null) {
-                        final s = details.date!;
-                        final e = s.add(const Duration(hours: 1));
-                        _createQuickAt(s, e);
-                        return;
-                      }
+                  child: DragTarget<Map<String, dynamic>>(
+                    onWillAcceptWithDetails: (details) {
+                      final ok = true;
+                      if (ok) setState(() => _calendarHoveringDrag = true);
+                      return ok;
+                    },
+                    onLeave: (_) {
+                      if (!mounted) return;
+                      setState(() => _calendarHoveringDrag = false);
+                    },
+                    onAcceptWithDetails: (details) async {
+                      setState(() => _calendarHoveringDrag = false);
 
-                      if (details.appointments != null && details.appointments!.isNotEmpty) {
-                        final app = details.appointments!.first;
-                        if (app is Appointment) {
-                          final raw = _filteredEvents.where((x) => x['id'] == app.id).toList();
-                          if (raw.isNotEmpty) _editEventDialog(raw.first);
-                        }
-                      }
+                      final offset = _lastGlobalDragPointer ?? details.offset;
+                      await _scheduleExternalDropByOffset(details.data, offset);
+
+                      _lastGlobalDragPointer = null;
                     },
-                    onDragEnd: (details) {
-                      final app = details.appointment;
-                      if (app is Appointment && details.droppingTime != null) {
-                        _moveAppointment(app, details.droppingTime!);
-                      }
-                    },
-                    onAppointmentResizeEnd: (details) {
-                      final app = details.appointment;
-                      if (app is Appointment &&
-                          details.startTime != null &&
-                          details.endTime != null) {
-                        _resizeAppointment(app, details.startTime!, details.endTime!);
-                      }
+                    builder: (context, candidateData, rejectedData) {
+                      return Stack(
+                        children: [
+                          SfCalendar(
+                            key: _calendarKey,
+                            controller: _calendarController,
+                            dataSource: _dataSource,
+                            allowDragAndDrop: true,
+                            allowAppointmentResize: true,
+                            onTap: (details) {
+                              if (details.appointments != null &&
+                                  details.appointments!.isNotEmpty) {
+                                final app = details.appointments!.first;
+                                if (app is Appointment) {
+                                  final dynamic appointmentId = app.id;
+                                  if (appointmentId == null) return;
+                                  final raw = _filteredEvents.where((x) {
+                                    final eventId = x['id'];
+                                    return eventId != null &&
+                                        eventId.toString() == appointmentId.toString();
+                                  }).toList();
+                                  if (raw.isNotEmpty) _editEventDialog(raw.first);
+                                }
+                              }
+                            },
+                            onDragEnd: (AppointmentDragEndDetails details) async {
+                              final app = details.appointment;
+                              final drop = details.droppingTime;
+                              if (app is Appointment && drop != null) {
+                                await _moveAppointment(app, drop);
+                              }
+                            },
+                            onAppointmentResizeEnd: (AppointmentResizeEndDetails details) async {
+                              final app = details.appointment;
+                              if (app is Appointment &&
+                                  details.startTime != null &&
+                                  details.endTime != null) {
+                                await _resizeAppointment(app, details.startTime!, details.endTime!);
+                              }
+                            },
+                          ),
+                          if (_calendarHoveringDrag)
+                            Positioned.fill(
+                              child: IgnorePointer(
+                                child: Container(
+                                  color: Colors.deepPurple.withValues(alpha: 0.08),
+                                  alignment: Alignment.topCenter,
+                                  padding: const EdgeInsets.only(top: 12),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: Colors.deepPurple,
+                                      borderRadius: BorderRadius.circular(20),
+                                    ),
+                                    child: const Text(
+                                      '拖到目标时间格后松开',
+                                      style: TextStyle(color: Colors.white),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      );
                     },
                   ),
                 ),
-                _buildUnscheduledPanel(),
               ],
             ),
           ),
         ],
       ),
     );
+  }
+}
+
+class CalendarEventDataSource extends CalendarDataSource {
+  CalendarEventDataSource(List<Appointment> source) {
+    appointments = source;
+  }
+
+  void updateAppointments(List<Appointment> source) {
+    appointments = source;
+    notifyListeners(CalendarDataSourceAction.reset, appointments!);
   }
 }
 // ============ 数据库视图（满足7条需求） ============
@@ -577,9 +702,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       if (!mounted) return;
       setState(() {
         _events = data;
-        if (!_isReordering) {
-          _localRows = null;
-        }
+        _localRows = null;
+        _isReordering = false;
       });
     });
 
@@ -607,6 +731,20 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       _localRows = null;
       _isReordering = false;
     });
+  }
+
+  Future<void> _fetchEventsNow() async {
+    final fresh = await Supabase.instance.client.from('events').select().order('sort_order');
+    if (!mounted) return;
+    setState(() {
+      _events = List<Map<String, dynamic>>.from(fresh);
+      _localRows = null;
+      _isReordering = false;
+    });
+  }
+
+  Future<void> _afterEventWrite() async {
+    await _fetchEventsNow();
   }
 
   Map<String, dynamic> get _currentDb {
@@ -749,12 +887,12 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       final left = _dbs.where((d) => d['id'].toString() != dbId).toList();
       setState(() => _selectedDbId = left.isNotEmpty ? left.first['id'].toString() : null);
     }
+    await _afterEventWrite();
   }
 
-  // 新增属性：带类型
   Future<void> _addPropertyFromHeaderPlus() async {
     final nameCtrl = TextEditingController();
-    String type = 'text'; // text | checkbox | tag
+    String type = 'text';
 
     await showDialog(
       context: context,
@@ -789,13 +927,9 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                 final types = Map<String, dynamic>.from(_propertyTypes);
                 final tags = Map<String, dynamic>.from(_tagOptions);
 
-                if (!schema.contains(key)) {
-                  schema.add(key);
-                }
+                if (!schema.contains(key)) schema.add(key);
                 types[key] = type;
-                if (type == 'tag' && tags[key] == null) {
-                  tags[key] = <String>[];
-                }
+                if (type == 'tag' && tags[key] == null) tags[key] = <String>[];
 
                 await Supabase.instance.client.from('databases').update({
                   'schema': schema,
@@ -845,17 +979,23 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
         await Supabase.instance.client.from('events').update({'properties': props}).eq('id', r['id']);
       }
     }
+
+    await _afterEventWrite();
   }
 
   Future<void> _deleteSelectedRows() async {
     if (_selectedEventIds.isEmpty) return;
     await Supabase.instance.client.from('events').delete().inFilter('id', _selectedEventIds.toList());
+    if (!mounted) return;
     setState(() => _selectedEventIds.clear());
+    await _afterEventWrite();
   }
 
   Future<void> _deleteOneRow(String id) async {
     await Supabase.instance.client.from('events').delete().eq('id', id);
+    if (!mounted) return;
     setState(() => _selectedEventIds.remove(id));
+    await _afterEventWrite();
   }
 
   Future<void> _reorderRows(int oldIndex, int newIndex) async {
@@ -863,13 +1003,12 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
 
     final current = [..._rows];
     if (newIndex > oldIndex) newIndex -= 1;
-
     final moved = current.removeAt(oldIndex);
     current.insert(newIndex, moved);
 
     setState(() {
       _isReordering = true;
-      _localRows = current; // 立即显示目标位置
+      _localRows = current;
     });
 
     try {
@@ -879,11 +1018,10 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
             .update({'sort_order': i + 1})
             .eq('id', current[i]['id']);
       }
+      await _afterEventWrite();
     } finally {
       if (!mounted) return;
-      setState(() {
-        _isReordering = false;
-      });
+      setState(() => _isReordering = false);
     }
   }
 
@@ -901,6 +1039,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
               await Supabase.instance.client.from('events').update({'title': c.text.trim()}).eq('id', row['id']);
               if (!mounted) return;
               Navigator.pop(context);
+              await _afterEventWrite();
             },
             child: const Text('保存'),
           ),
@@ -926,7 +1065,6 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     return DateTime(d.year, d.month, d.day, t.hour, t.minute);
   }
 
-  // 修正：只改开始，不自动冒出结束
   Future<void> _editStartTime(Map<String, dynamic> row) async {
     final oldStart = row['start_time'] != null ? DateTime.parse(row['start_time']).toLocal() : null;
     final dt = await _pickDateThenTime(oldStart);
@@ -935,6 +1073,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     await Supabase.instance.client.from('events').update({
       'start_time': dt.toUtc().toIso8601String(),
     }).eq('id', row['id']);
+
+    await _afterEventWrite();
   }
 
   Future<void> _editEndTime(Map<String, dynamic> row) async {
@@ -951,6 +1091,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     await Supabase.instance.client.from('events').update({
       'end_time': dt.toUtc().toIso8601String(),
     }).eq('id', row['id']);
+
+    await _afterEventWrite();
   }
 
   Future<void> _editReminder(Map<String, dynamic> row) async {
@@ -985,6 +1127,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
               await Supabase.instance.client.from('events').update({'properties': props}).eq('id', row['id']);
               if (!mounted) return;
               Navigator.pop(context);
+              await _afterEventWrite();
             },
             child: const Text('保存'),
           ),
@@ -1097,6 +1240,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
 
                 if (!mounted) return;
                 Navigator.pop(context);
+                await _afterEventWrite();
               },
               child: const Text('保存'),
             ),
@@ -1114,6 +1258,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       final current = (props[key] == true);
       props[key] = !current;
       await Supabase.instance.client.from('events').update({'properties': props}).eq('id', row['id']);
+      await _afterEventWrite();
       return;
     }
 
@@ -1122,7 +1267,6 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       final current = props[key]?.toString() ?? '';
       final options = List<String>.from(_tagOptions[key] ?? []);
       String selected = current;
-
       final newTagCtrl = TextEditingController();
 
       await showDialog(
@@ -1159,9 +1303,10 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                     if (!list.contains(input)) list.add(input);
                     dbTagOptions[key] = list;
                     selected = input;
-                    await Supabase.instance.client.from('databases').update({
-                      'tag_options': dbTagOptions,
-                    }).eq('id', _currentDb['id']);
+                    await Supabase.instance.client
+                        .from('databases')
+                        .update({'tag_options': dbTagOptions})
+                        .eq('id', _currentDb['id']);
                   }
 
                   if (selected.isEmpty) {
@@ -1174,6 +1319,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
 
                   if (!mounted) return;
                   Navigator.pop(context);
+                  await _afterEventWrite();
                 },
                 child: const Text('保存'),
               ),
@@ -1184,7 +1330,6 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       return;
     }
 
-    // text
     final c = TextEditingController(text: row['properties']?[key]?.toString() ?? '');
     await showDialog(
       context: context,
@@ -1205,6 +1350,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
               await Supabase.instance.client.from('events').update({'properties': props}).eq('id', row['id']);
               if (!mounted) return;
               Navigator.pop(context);
+              await _afterEventWrite();
             },
             child: const Text('保存'),
           ),
@@ -1224,6 +1370,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       'properties': {},
       'sort_order': _rows.length + 1,
     });
+    await _afterEventWrite();
   }
 
   Widget _headCell(String key, String label, {bool deletable = false, VoidCallback? onDelete}) {
@@ -1339,7 +1486,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
               : Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: Colors.deepPurple.withOpacity(0.12),
+                    color: Colors.deepPurple.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: Text(v, style: const TextStyle(fontSize: 12)),
@@ -1436,7 +1583,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                       final id = db['id'].toString();
                       final selected = id == _selectedDbId;
                       return Material(
-                        color: selected ? Colors.deepPurple.withOpacity(0.08) : Colors.transparent,
+                        color: selected ?Colors.deepPurple.withValues(alpha: 0.08) : Colors.transparent,
                         child: ListTile(
                           dense: true,
                           title: Text(
@@ -1587,15 +1734,5 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
         ],
       ),
     );
-  }
-}
-class _EventDataSource extends CalendarDataSource {
-  _EventDataSource(List<Appointment> source) {
-    appointments = source;
-  }
-
-  void updateAppointments(List<Appointment> newAppointments) {
-    appointments = newAppointments;
-    notifyListeners(CalendarDataSourceAction.reset, newAppointments);
   }
 }
