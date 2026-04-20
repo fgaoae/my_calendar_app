@@ -175,7 +175,9 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
   }
 
   List<Map<String, dynamic>> get _visibleEvents {
-    return _allEvents;
+    final rows = List<Map<String, dynamic>>.from(_allEvents);
+    rows.sort(_compareEventsByOrder);
+    return rows;
   }
 
   List<Map<String, dynamic>> get _visibleDbs {
@@ -185,9 +187,41 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
   }
 
   List<Map<String, dynamic>> _eventsByDb(String dbId) {
-    return _allEvents
+    final rows = _allEvents
         .where((e) => e['database_id']?.toString() == dbId)
         .toList();
+    rows.sort(_compareEventsByOrder);
+    return rows;
+  }
+
+  int _eventSortOrder(Map<String, dynamic> event) {
+    return (event['sort_order'] as num?)?.toInt() ?? 0;
+  }
+
+  DateTime? _eventCreatedAt(Map<String, dynamic> event) {
+    final raw = event['created_at']?.toString();
+    if (raw == null || raw.isEmpty) return null;
+    return DateTime.tryParse(raw)?.toUtc();
+  }
+
+  int _compareEventsByOrder(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final bySortOrder = _eventSortOrder(a).compareTo(_eventSortOrder(b));
+    if (bySortOrder != 0) return bySortOrder;
+
+    final aCreated = _eventCreatedAt(a);
+    final bCreated = _eventCreatedAt(b);
+    if (aCreated != null && bCreated != null) {
+      final byCreated = aCreated.compareTo(bCreated);
+      if (byCreated != 0) return byCreated;
+    } else if (aCreated != null) {
+      return -1;
+    } else if (bCreated != null) {
+      return 1;
+    }
+
+    final aId = a['id']?.toString() ?? '';
+    final bId = b['id']?.toString() ?? '';
+    return aId.compareTo(bId);
   }
 
   String _pad2(int value) => value.toString().padLeft(2, '0');

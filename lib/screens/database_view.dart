@@ -214,15 +214,41 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
   Map<String, dynamic> get _tagOptions =>
       Map<String, dynamic>.from(_currentDb['tag_options'] ?? {});
 
+  int _eventSortOrder(Map<String, dynamic> event) {
+    return (event['sort_order'] as num?)?.toInt() ?? 0;
+  }
+
+  DateTime? _eventCreatedAt(Map<String, dynamic> event) {
+    final raw = event['created_at']?.toString();
+    if (raw == null || raw.isEmpty) return null;
+    return DateTime.tryParse(raw)?.toUtc();
+  }
+
+  int _compareEventsByOrder(Map<String, dynamic> a, Map<String, dynamic> b) {
+    final bySortOrder = _eventSortOrder(a).compareTo(_eventSortOrder(b));
+    if (bySortOrder != 0) return bySortOrder;
+
+    final aCreated = _eventCreatedAt(a);
+    final bCreated = _eventCreatedAt(b);
+    if (aCreated != null && bCreated != null) {
+      final byCreated = aCreated.compareTo(bCreated);
+      if (byCreated != 0) return byCreated;
+    } else if (aCreated != null) {
+      return -1;
+    } else if (bCreated != null) {
+      return 1;
+    }
+
+    final aId = a['id']?.toString() ?? '';
+    final bId = b['id']?.toString() ?? '';
+    return aId.compareTo(bId);
+  }
+
   List<Map<String, dynamic>> _buildRowsFromSource() {
     final rows = _events
         .where((e) => e['database_id']?.toString() == _selectedDbId)
         .toList();
-    rows.sort(
-      (a, b) => ((a['sort_order'] ?? 0) as num).compareTo(
-        (b['sort_order'] ?? 0) as num,
-      ),
-    );
+    rows.sort(_compareEventsByOrder);
     return rows;
   }
 
@@ -1436,6 +1462,11 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
   }
 
   Future<void> _addRow() async {
+    final maxSortOrder = _rows.fold<int>(0, (maxValue, row) {
+      final current = _eventSortOrder(row);
+      return current > maxValue ? current : maxValue;
+    });
+
     final inserted = await Supabase.instance.client.from('events').insert({
       'database_id': _selectedDbId,
       'title': '未命名',
@@ -1444,7 +1475,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       'end_time': null,
       'is_recurring': false,
       'properties': {},
-      'sort_order': _rows.length + 1,
+      'sort_order': maxSortOrder + 1,
     }).select().single();
 
     if (!mounted) return;
