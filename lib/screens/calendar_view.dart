@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_animate/flutter_animate.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:syncfusion_flutter_calendar/calendar.dart';
 
 import '../constants.dart';
+import '../theme/airy_theme.dart';
 import '../utils/date_helpers.dart';
 import '../utils/rrule_builder.dart';
+import '../widgets/airy_components.dart';
 
 // ============ 日历视图 ============
 class CalendarViewWidget extends StatefulWidget {
@@ -37,6 +40,8 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
   List<Map<String, dynamic>> _allEvents = [];
   List<Map<String, dynamic>> _allDbs = [];
   bool _loading = true;
+  bool _isRefreshing = false;
+  int _refreshTasks = 0;
 
   Timer? _syncDebounce;
 
@@ -92,24 +97,72 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
     super.dispose();
   }
 
+  void _startRefresh() {
+    _refreshTasks += 1;
+    if (!_isRefreshing && mounted) {
+      setState(() => _isRefreshing = true);
+    }
+  }
+
+  void _endRefresh() {
+    if (_refreshTasks > 0) {
+      _refreshTasks -= 1;
+    }
+    if (_refreshTasks == 0 && _isRefreshing && mounted) {
+      setState(() => _isRefreshing = false);
+    }
+  }
+
+  Future<void> _refreshAllData() async {
+    await Future.wait([
+      _hardRefreshEvents(),
+      _hardRefreshDatabases(),
+    ]);
+  }
+
   Future<void> _hardRefreshEvents() async {
-    final fresh = await Supabase.instance.client
-        .from('events')
-        .select()
-        .order('sort_order');
-    _allEvents = List<Map<String, dynamic>>.from(fresh);
-    _rebuildAppointments();
+    _startRefresh();
+    try {
+      final fresh = await Supabase.instance.client
+          .from('events')
+          .select()
+          .order('sort_order');
+      _allEvents = List<Map<String, dynamic>>.from(fresh);
+      _rebuildAppointments();
+    } finally {
+      _endRefresh();
+    }
   }
 
   Future<void> _hardRefreshDatabases() async {
-    final fresh = await Supabase.instance.client
-        .from('databases')
-        .select()
-        .order('created_at');
-    _allDbs = List<Map<String, dynamic>>.from(fresh);
-    if (!mounted) return;
-    setState(() => _loading = false);
-    _rebuildAppointments();
+    _startRefresh();
+    try {
+      final fresh = await Supabase.instance.client
+          .from('databases')
+          .select()
+          .order('created_at');
+      _allDbs = List<Map<String, dynamic>>.from(fresh);
+      if (!mounted) return;
+      setState(() => _loading = false);
+      _rebuildAppointments();
+    } finally {
+      _endRefresh();
+    }
+  }
+
+  Widget _buildAnimatedDialog(Widget child) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.94, end: 1),
+      duration: AiryTheme.medium,
+      curve: Curves.easeOutCubic,
+      builder: (context, value, _) {
+        final opacity = ((value - 0.94) / 0.06).clamp(0.0, 1.0);
+        return Opacity(
+          opacity: opacity,
+          child: Transform.scale(scale: value, child: child),
+        );
+      },
+    );
   }
 
   String? get _hiddenDbId {
@@ -135,6 +188,79 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
     return _allEvents
         .where((e) => e['database_id']?.toString() == dbId)
         .toList();
+  }
+
+  String _pad2(int value) => value.toString().padLeft(2, '0');
+
+  String _formatYmd(DateTime dt) {
+    return '${dt.year}年${_pad2(dt.month)}月${_pad2(dt.day)}日';
+  }
+
+  String _formatHm(DateTime dt) {
+    return '${_pad2(dt.hour)}:${_pad2(dt.minute)}';
+  }
+
+  DateTime _startOfWeek(DateTime dt) {
+    final date = DateTime(dt.year, dt.month, dt.day);
+    final diff = date.weekday - DateTime.monday;
+    return date.subtract(Duration(days: diff));
+  }
+
+  String _formatTopBarDateLabel() {
+    final date = _calendarController.displayDate ?? DateTime.now();
+    final view = _calendarController.view ?? CalendarView.week;
+
+    switch (view) {
+      case CalendarView.month:
+        return '${date.year}年${_pad2(date.month)}月';
+      case CalendarView.day:
+        return _formatYmd(date);
+      case CalendarView.timelineWeek:
+      case CalendarView.week:
+        final start = _startOfWeek(date);
+        final end = start.add(const Duration(days: 6));
+        return '${_formatYmd(start)} - ${_formatYmd(end)}';
+      default:
+        return _formatYmd(date);
+    }
+  }
+
+  Widget _buildAppointmentCard(
+    BuildContext context,
+    CalendarAppointmentDetails details,
+  ) {
+    final dynamic first = details.appointments.isNotEmpty
+        ? details.appointments.first
+        : null;
+    if (first is! Appointment) {
+      return const SizedBox.shrink();
+    }
+
+    final view = _calendarController.view ?? CalendarView.week;
+    final compact =
+        view == CalendarView.month ||
+        details.bounds.height < 34 ||
+        details.bounds.width < 100;
+    final appId = first.id?.toString() ??
+        '${first.startTime.microsecondsSinceEpoch}-${first.subject}';
+
+    return _AiryAppointmentCard(
+      key: ValueKey('calendar-app-$appId'),
+      subject: first.subject,
+      timeText: '${_formatHm(first.startTime)}-${_formatHm(first.endTime)}',
+      color: first.color,
+      compact: compact,
+      recurring: (first.recurrenceRule ?? '').toString().isNotEmpty,
+    );
+  }
+
+  Color _databaseColor(String? dbId) {
+    if (dbId == null || dbId.isEmpty) return AiryPalette.accent;
+    final hiddenId = _hiddenDbId;
+    if (hiddenId != null && hiddenId == dbId) {
+      return AiryPalette.textMuted;
+    }
+    return AiryPalette.databaseAccentForId(dbId);
   }
 
   void _patchLocalEventById(String id, Map<String, dynamic> updates) {
@@ -184,6 +310,8 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
           }
         }
 
+        final dbColor = _databaseColor(item['database_id']?.toString());
+
         list.add(
           Appointment(
             id: item['id'],
@@ -191,7 +319,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
             endTime: end,
             subject: (item['title'] ?? '未命名').toString(),
             notes: (item['description'] ?? '').toString(),
-            color: Colors.deepPurpleAccent,
+            color: dbColor,
             recurrenceRule: rrule,
             recurrenceExceptionDates: exDates.isEmpty ? null : exDates,
           ),
@@ -396,6 +524,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
   }) async {
     // Ensure we have the latest database schema
     await _hardRefreshDatabases();
+    if (!mounted) return;
 
     final titleCtrl = TextEditingController(
       text: row['title']?.toString() ?? '',
@@ -471,12 +600,11 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
       }
     }
 
-    bool tagOptionsDirty = false;
-
     await showDialog(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (dialogContext, setD) => AlertDialog(
+        builder: (dialogContext, setD) => _buildAnimatedDialog(
+          AlertDialog(
           title: const Text('编辑日程'),
           content: SizedBox(
             width: 560,
@@ -515,6 +643,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                       final base = end ?? start ?? DateTime.now();
                       final dt = await DateHelper.pickDateThenTime(dialogContext, base);
                       if (dt == null) return;
+                      if (!dialogContext.mounted) return;
                       if (start != null && dt.isBefore(start!)) {
                         ScaffoldMessenger.of(dialogContext).showSnackBar(
                           const SnackBar(content: Text('结束时间不能早于开始时间')),
@@ -529,7 +658,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                   ),
                   const SizedBox(height: 8),
                   DropdownButtonFormField<String>(
-                    value: reminder,
+                    initialValue: reminder,
                     decoration: const InputDecoration(labelText: '提醒'),
                     items: const [
                       DropdownMenuItem(value: 'NONE', child: Text('不提醒')),
@@ -541,7 +670,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                   ),
                   const SizedBox(height: 8),
                   DropdownButtonFormField<String>(
-                    value: freq,
+                    initialValue: freq,
                     decoration: const InputDecoration(labelText: '重复'),
                     items: const [
                       DropdownMenuItem(value: 'NONE', child: Text('不重复')),
@@ -664,12 +793,12 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                                             ),
                                             decoration: BoxDecoration(
                                               color: isSelected
-                                                  ? Colors.deepPurple
+                                                  ? AiryPalette.accent
                                                       .withValues(alpha: 0.2)
                                                   : Colors.transparent,
                                               border: Border.all(
                                                 color: isSelected
-                                                    ? Colors.deepPurple
+                                                    ? AiryPalette.accent
                                                     : Colors.grey.shade300,
                                                 width: isSelected ? 2 : 1,
                                               ),
@@ -687,7 +816,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                                                         ? FontWeight.bold
                                                         : FontWeight.normal,
                                                     color: isSelected
-                                                        ? Colors.deepPurple
+                                                        ? AiryPalette.accent
                                                         : Colors.black87,
                                                   ),
                                                 ),
@@ -696,7 +825,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                                                   const Icon(
                                                     Icons.check,
                                                     size: 14,
-                                                    color: Colors.deepPurple,
+                                                    color: AiryPalette.accent,
                                                   ),
                                                 ],
                                               ],
@@ -789,23 +918,28 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                 if (hasRecurrence && occurrenceStart != null) {
                   final choice = await showDialog<String>(
                     context: dialogContext,
-                    builder: (c) => AlertDialog(
-                      title: const Text('删除重复事件'),
-                      content: const Text('要删除"所有重复"还是"仅本次"？'),
-                      actions: [
-                        TextButton(
-                          onPressed: () => Navigator.pop(c),
-                          child: const Text('取消'),
-                        ),
-                        TextButton(
-                          onPressed: () => Navigator.pop(c, 'ONE'),
-                          child: const Text('仅本次'),
-                        ),
-                        ElevatedButton(
-                          onPressed: () => Navigator.pop(c, 'ALL'),
-                          child: const Text('删除所有'),
-                        ),
-                      ],
+                    builder: (c) => _buildAnimatedDialog(
+                      AlertDialog(
+                        title: const Text('删除重复事件'),
+                        content: const Text('要删除"所有重复"还是"仅本次"？'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(c),
+                            child: const Text('取消'),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.pop(c, 'ONE'),
+                            child: const Text('仅本次'),
+                          ),
+                          ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AiryPalette.danger,
+                            ),
+                            onPressed: () => Navigator.pop(c, 'ALL'),
+                            child: const Text('删除所有'),
+                          ),
+                        ],
+                      ),
                     ),
                   );
                   if (choice == null) return;
@@ -834,8 +968,9 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                         .update({'properties': updatedProps})
                         .eq('id', id);
 
-                    if (!mounted) return;
+                      if (!dialogContext.mounted) return;
                     Navigator.pop(dialogContext);
+                      if (!mounted) return;
                     _patchLocalEventById(id, {'properties': updatedProps});
                     widget.requestSync();
                     return;
@@ -846,8 +981,9 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                     .from('events')
                     .delete()
                     .eq('id', id);
-                if (!mounted) return;
+                  if (!dialogContext.mounted) return;
                 Navigator.pop(dialogContext);
+                  if (!mounted) return;
                 _removeLocalEventById(id);
                 widget.requestSync();
               },
@@ -914,8 +1050,6 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                   }
                 }
 
-                final dbTagOptions = Map<String, dynamic>.from(tagOptions);
-
                 for (final key in schema) {
                   final type = propertyTypes[key]?.toString() ?? 'text';
 
@@ -941,13 +1075,6 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                   } else {
                     updatedProps[key] = v;
                   }
-                }
-
-                if (tagOptionsDirty && dbRow != null) {
-                  await Supabase.instance.client
-                      .from('databases')
-                      .update({'tag_options': dbTagOptions})
-                      .eq('id', dbRow['id']);
                 }
 
                 final id = row['id']?.toString();
@@ -980,16 +1107,15 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                   }
                 }
 
-                if (!mounted) return;
+                if (!dialogContext.mounted) return;
                 Navigator.pop(dialogContext);
+                if (!mounted) return;
                 widget.requestSync();
-                if (tagOptionsDirty) {
-                  await _hardRefreshDatabases();
-                }
               },
               child: const Text('保存'),
             ),
           ],
+        ),
         ),
       ),
     );
@@ -1003,6 +1129,7 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
 
   Widget _buildDragHandle(Map<String, dynamic> e) {
     final title = e['title']?.toString() ?? '未命名';
+    final dbColor = _databaseColor(e['database_id']?.toString());
     return Draggable<Map<String, dynamic>>(
       data: e,
       dragAnchorStrategy: pointerDragAnchorStrategy,
@@ -1012,8 +1139,20 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
           constraints: const BoxConstraints(maxWidth: 120),
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
           decoration: BoxDecoration(
-            color: Colors.deepPurple.withValues(alpha: 0.9),
-            borderRadius: BorderRadius.circular(8),
+            gradient: LinearGradient(
+              colors: [
+                dbColor,
+                dbColor.withValues(alpha: 0.78),
+              ],
+            ),
+            borderRadius: BorderRadius.circular(10),
+            boxShadow: [
+              BoxShadow(
+                color: dbColor.withValues(alpha: 0.28),
+                blurRadius: 16,
+                offset: const Offset(0, 8),
+              ),
+            ],
           ),
           child: Text(
             title,
@@ -1038,168 +1177,291 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
         if (!mounted) return;
         setState(() => _calendarHoveringDrag = false);
       },
-      child: const Padding(
+      child: Padding(
         padding: EdgeInsets.symmetric(horizontal: 6),
-        child: Icon(Icons.drag_indicator, size: 18),
+        child: Icon(Icons.drag_indicator, size: 18, color: dbColor),
       ),
     );
   }
 
   Widget _buildLeftDatabaseWithData() {
-    return Container(
+    return SizedBox(
       width: 320,
-      decoration: BoxDecoration(
-        color: Colors.grey.shade50,
-        border: Border(right: BorderSide(color: Colors.grey.shade300)),
-      ),
-      child: Column(
-        children: [
-          const SizedBox(height: 8),
-          Expanded(
-            child: ListView(
-              children: _visibleDbs.map((db) {
-                final dbId = db['id'].toString();
-                final dbName = db['name']?.toString() ?? '未命名数据库';
-                final rows = _eventsByDb(dbId);
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 8, 12),
+        child: AiryPanel(
+          padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('数据库事件', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              Expanded(
+                child: ListView(
+                  children: _visibleDbs.asMap().entries.map((entry) {
+                    final index = entry.key;
+                    final db = entry.value;
+                    final dbId = db['id'].toString();
+                    final dbName = db['name']?.toString() ?? '未命名数据库';
+                    final dbColor = _databaseColor(dbId);
+                    final rows = _eventsByDb(dbId);
 
-                return ExpansionTile(
-                  title: Container(
-                    padding: const EdgeInsets.symmetric(
-                      vertical: 4,
-                      horizontal: 6,
-                    ),
-                    child: Text(
-                      dbName,
-                      style: const TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                  subtitle: Text('${rows.length} 条'),
-                  children: rows.map((e) {
-                    final title = e['title']?.toString() ?? '未命名';
-                    final sub = e['start_time'] == null
-                        ? '未排期'
-                        : DateTime.parse(
-                            e['start_time'],
-                          ).toLocal().toString().substring(0, 16);
-
-                    return Container(
-                      margin: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        border: Border.all(color: Colors.grey.shade200),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: ListTile(
-                              dense: true,
-                              title: Text(
-                                title,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              subtitle: Text(sub),
-                              onTap: () => _editEventDialog(e),
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: AiryPanel(
+                        padding: EdgeInsets.zero,
+                        child: Theme(
+                          data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                          child: ExpansionTile(
+                            collapsedShape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
                             ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            tilePadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+                            childrenPadding: const EdgeInsets.only(left: 8, right: 8, bottom: 8),
+                            iconColor: dbColor,
+                            collapsedIconColor: dbColor.withValues(alpha: 0.75),
+                            title: Row(
+                              children: [
+                                Container(
+                                  width: 10,
+                                  height: 10,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: dbColor,
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: dbColor.withValues(alpha: 0.34),
+                                        blurRadius: 8,
+                                        offset: const Offset(0, 2),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    dbName,
+                                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            subtitle: Padding(
+                              padding: const EdgeInsets.only(top: 2),
+                              child: AiryStatusPill(text: '${rows.length} 条', color: dbColor),
+                            ),
+                            children: rows.asMap().entries.map((rowEntry) {
+                              final rowIndex = rowEntry.key;
+                              final e = rowEntry.value;
+                              final title = e['title']?.toString() ?? '未命名';
+                              final rawStart = e['start_time']?.toString();
+                              final parsed = rawStart == null
+                                  ? null
+                                  : DateTime.tryParse(rawStart)?.toLocal();
+                              final sub = parsed == null
+                                  ? '未排期'
+                                  : parsed.toString().substring(0, 16);
+
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 2),
+                                child: AiryPanel(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                  child: Row(
+                                    children: [
+                                      Container(
+                                        width: 3,
+                                        height: 28,
+                                        margin: const EdgeInsets.only(left: 4, right: 8),
+                                        decoration: BoxDecoration(
+                                          color: dbColor.withValues(alpha: 0.75),
+                                          borderRadius: BorderRadius.circular(999),
+                                        ),
+                                      ),
+                                      Expanded(
+                                        child: ListTile(
+                                          dense: true,
+                                          title: Text(
+                                            title,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: Theme.of(context).textTheme.bodyLarge,
+                                          ),
+                                          subtitle: Text(sub),
+                                          onTap: () => _editEventDialog(e),
+                                        ),
+                                      ),
+                                      _buildDragHandle(e),
+                                    ],
+                                  ),
+                                )
+                                    .animate(delay: (40 + (rowIndex % 10) * 18).ms)
+                                    .fadeIn(duration: 260.ms, curve: Curves.easeOutCubic)
+                                    .slideY(begin: 0.05, end: 0, duration: 260.ms),
+                              );
+                            }).toList(),
                           ),
-                          _buildDragHandle(e),
-                        ],
-                      ),
+                        ),
+                      )
+                          .animate(delay: (80 + index * 35).ms)
+                          .fadeIn(duration: 360.ms, curve: Curves.easeOutCubic)
+                          .slideX(begin: -0.03, end: 0, duration: 360.ms),
                     );
                   }).toList(),
-                );
-              }).toList(),
-            ),
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
 
   Widget _buildTopBar() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      color: Colors.grey.shade50,
-      child: Row(
-        children: [
-          IconButton(
-            icon: const Icon(Icons.chevron_left),
-            onPressed: () {
-              final d = _calendarController.displayDate ?? DateTime.now();
-              _calendarController.displayDate =
-                  _calendarController.view == CalendarView.month
-                  ? DateTime(d.year, d.month - 1, d.day)
-                  : d.subtract(const Duration(days: 7));
-              setState(() {});
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.today),
-            onPressed: () {
-              _calendarController.displayDate = DateTime.now();
-              setState(() {});
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.chevron_right),
-            onPressed: () {
-              final d = _calendarController.displayDate ?? DateTime.now();
-              _calendarController.displayDate =
-                  _calendarController.view == CalendarView.month
-                  ? DateTime(d.year, d.month + 1, d.day)
-                  : d.add(const Duration(days: 7));
-              setState(() {});
-            },
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              _calendarController.displayDate?.toString().substring(0, 10) ??
-                  '',
-              style: const TextStyle(fontWeight: FontWeight.w600),
+    final dateLabel = _formatTopBarDateLabel();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      child: AiryPanel(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Row(
+          children: [
+            IconButton.filledTonal(
+              icon: const Icon(Icons.chevron_left),
+              onPressed: () {
+                final d = _calendarController.displayDate ?? DateTime.now();
+                _calendarController.displayDate =
+                    _calendarController.view == CalendarView.month
+                    ? DateTime(d.year, d.month - 1, d.day)
+                    : d.subtract(const Duration(days: 7));
+                setState(() {});
+              },
             ),
-          ),
-          DropdownButton<CalendarView>(
-            value: _calendarController.view,
-            items: const [
-              DropdownMenuItem(value: CalendarView.month, child: Text('月')),
-              DropdownMenuItem(value: CalendarView.week, child: Text('周')),
-              DropdownMenuItem(value: CalendarView.day, child: Text('日')),
-              DropdownMenuItem(
-                value: CalendarView.timelineWeek,
-                child: Text('时间线'),
+            const SizedBox(width: 8),
+            IconButton.filledTonal(
+              icon: const Icon(Icons.today),
+              onPressed: () {
+                _calendarController.displayDate = DateTime.now();
+                setState(() {});
+              },
+            ),
+            const SizedBox(width: 8),
+            IconButton.filledTonal(
+              icon: const Icon(Icons.chevron_right),
+              onPressed: () {
+                final d = _calendarController.displayDate ?? DateTime.now();
+                _calendarController.displayDate =
+                    _calendarController.view == CalendarView.month
+                    ? DateTime(d.year, d.month + 1, d.day)
+                    : d.add(const Duration(days: 7));
+                setState(() {});
+              },
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: AnimatedSwitcher(
+                duration: AiryTheme.quick,
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: const Offset(0.04, 0),
+                        end: Offset.zero,
+                      ).animate(animation),
+                      child: child,
+                    ),
+                  );
+                },
+                child: Text(
+                  dateLabel,
+                  key: ValueKey<String>(dateLabel),
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
               ),
-            ],
-            onChanged: (v) {
-              if (v == null) return;
-              setState(() => _calendarController.view = v);
-            },
-          ),
-        ],
-      ),
+            ),
+            DropdownButton<CalendarView>(
+              value: _calendarController.view,
+              borderRadius: BorderRadius.circular(12),
+              dropdownColor: Colors.white,
+              items: const [
+                DropdownMenuItem(value: CalendarView.month, child: Text('月')),
+                DropdownMenuItem(value: CalendarView.week, child: Text('周')),
+                DropdownMenuItem(value: CalendarView.day, child: Text('日')),
+                DropdownMenuItem(
+                  value: CalendarView.timelineWeek,
+                  child: Text('时间线'),
+                ),
+              ],
+              onChanged: (v) {
+                if (v == null) return;
+                setState(() => _calendarController.view = v);
+              },
+            ),
+          ],
+        ),
+      ).animate().fadeIn(duration: 360.ms).slideY(begin: -0.08, end: 0, duration: 360.ms),
     );
   }
 
   @override
   Widget build(BuildContext context) {
     if (_loading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const Scaffold(
+        backgroundColor: Colors.transparent,
+        body: AiryBackground(child: Center(child: CircularProgressIndicator())),
+      );
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text('日程')),
-      body: Column(
-        children: [
-          _buildTopBar(),
-          Expanded(
-            child: Row(
-              children: [
-                _buildLeftDatabaseWithData(),
-                Expanded(
-                  child: DragTarget<Map<String, dynamic>>(
+      backgroundColor: Colors.transparent,
+      appBar: AppBar(
+        title: const Text('日程'),
+        actions: [
+          AirySyncStatus(
+            isSyncing: _isRefreshing,
+            keyPrefix: 'calendar',
+          ),
+          AirySyncButton(
+            isSyncing: _isRefreshing,
+            keyPrefix: 'calendar',
+            onPressed: () {
+              unawaited(_refreshAllData());
+            },
+          ),
+        ],
+      ),
+      body: AiryBackground(
+        child: Column(
+          children: [
+            _buildTopBar(),
+            AnimatedContainer(
+              duration: AiryTheme.quick,
+              curve: Curves.easeOutCubic,
+              height: _isRefreshing ? 3 : 0,
+              margin: const EdgeInsets.symmetric(horizontal: 12),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(999),
+                child: const LinearProgressIndicator(
+                  backgroundColor: AiryPalette.accentSoft,
+                  color: AiryPalette.accent,
+                ),
+              ),
+            ),
+            Expanded(
+              child: Row(
+                children: [
+                  _buildLeftDatabaseWithData(),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(4, 8, 12, 12),
+                      child: AiryPanel(
+                        padding: EdgeInsets.zero,
+                        child: DragTarget<Map<String, dynamic>>(
                     onWillAcceptWithDetails: (details) {
                       final ok = true;
                       if (ok) setState(() => _calendarHoveringDrag = true);
@@ -1270,6 +1532,8 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                             key: _calendarKey,
                             controller: _calendarController,
                             dataSource: _dataSource,
+                            headerHeight: 0,
+                            appointmentBuilder: _buildAppointmentCard,
                             allowDragAndDrop: true,
                             allowAppointmentResize: true,
                             onLongPress: (details) async {
@@ -1292,11 +1556,12 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                                         eventId.toString() ==
                                             appointmentId.toString();
                                   }).toList();
-                                  if (raw.isNotEmpty)
+                                  if (raw.isNotEmpty) {
                                     _editEventDialog(
                                       raw.first,
                                       occurrenceStart: app.startTime,
                                     );
+                                  }
                                 }
                               }
                             },
@@ -1322,27 +1587,36 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                                   }
                                 },
                           ),
-                          if (_calendarHoveringDrag)
                             Positioned.fill(
                               child: IgnorePointer(
-                                child: Container(
-                                  color: Colors.deepPurple.withValues(
-                                    alpha: 0.08,
-                                  ),
-                                  alignment: Alignment.topCenter,
-                                  padding: const EdgeInsets.only(top: 12),
+                                child: AnimatedOpacity(
+                                  opacity: _calendarHoveringDrag ? 1 : 0,
+                                  duration: AiryTheme.quick,
+                                  curve: Curves.easeOutCubic,
                                   child: Container(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 12,
-                                      vertical: 6,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: Colors.deepPurple,
-                                      borderRadius: BorderRadius.circular(20),
-                                    ),
-                                    child: const Text(
-                                      '拖到目标时间格后松开',
-                                      style: TextStyle(color: Colors.white),
+                                    color: AiryPalette.accent.withValues(alpha: 0.08),
+                                    alignment: Alignment.topCenter,
+                                    padding: const EdgeInsets.only(top: 12),
+                                    child: AnimatedSlide(
+                                      offset: _calendarHoveringDrag
+                                          ? Offset.zero
+                                          : const Offset(0, -0.15),
+                                      duration: AiryTheme.quick,
+                                      curve: Curves.easeOutCubic,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 6,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: AiryPalette.accent,
+                                          borderRadius: BorderRadius.circular(20),
+                                        ),
+                                        child: const Text(
+                                          '拖到目标时间格后松开',
+                                          style: TextStyle(color: Colors.white),
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -1351,12 +1625,151 @@ class _CalendarViewWidgetState extends State<CalendarViewWidget> {
                         ],
                       );
                     },
-                  ),
+                          ),
+                        ).animate().fadeIn(duration: 420.ms).scale(
+                              begin: const Offset(0.99, 0.99),
+                              end: const Offset(1, 1),
+                              duration: 420.ms,
+                            ),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
             ),
+            ],
           ),
-        ],
+      ),
+    );
+  }
+}
+
+class _AiryAppointmentCard extends StatefulWidget {
+  const _AiryAppointmentCard({
+    required this.subject,
+    required this.timeText,
+    required this.color,
+    required this.compact,
+    required this.recurring,
+    super.key,
+  });
+
+  final String subject;
+  final String timeText;
+  final Color color;
+  final bool compact;
+  final bool recurring;
+
+  @override
+  State<_AiryAppointmentCard> createState() => _AiryAppointmentCardState();
+}
+
+class _AiryAppointmentCardState extends State<_AiryAppointmentCard> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final base = widget.color;
+    final start = base.withValues(alpha: widget.compact ? 0.9 : 0.94);
+    final end = base.withValues(alpha: widget.compact ? 0.72 : 0.8);
+
+    return MouseRegion(
+      onEnter: (_) {
+        if (!_hovered) {
+          setState(() => _hovered = true);
+        }
+      },
+      onExit: (_) {
+        if (_hovered) {
+          setState(() => _hovered = false);
+        }
+      },
+      child: AnimatedScale(
+        scale: _hovered && !widget.compact ? 1.015 : 1,
+        duration: AiryTheme.quick,
+        curve: Curves.easeOutCubic,
+        child: AnimatedContainer(
+          duration: AiryTheme.quick,
+          curve: Curves.easeOutCubic,
+          margin: EdgeInsets.all(widget.compact ? 1 : 2),
+          padding: EdgeInsets.symmetric(
+            horizontal: widget.compact ? 6 : 8,
+            vertical: widget.compact ? 2 : 4,
+          ),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(colors: [start, end]),
+            borderRadius: BorderRadius.circular(widget.compact ? 8 : 10),
+            border: Border.all(
+              color: Colors.white.withValues(alpha: _hovered ? 0.84 : 0.66),
+              width: _hovered ? 1.2 : 1,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: base.withValues(alpha: _hovered ? 0.28 : 0.18),
+                blurRadius: _hovered ? 12 : 8,
+                offset: Offset(0, _hovered ? 6 : 4),
+              ),
+            ],
+          ),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final canShowTime =
+                  !widget.compact &&
+                  constraints.maxHeight >= 34 &&
+                  constraints.maxWidth >= 120;
+
+              return Stack(
+                children: [
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          widget.subject,
+                          maxLines: canShowTime ? 1 : 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: canShowTime ? 11 : 12,
+                            fontWeight: FontWeight.w700,
+                            height: 1.1,
+                          ),
+                        ),
+                        if (canShowTime)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: Text(
+                              widget.timeText,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.92),
+                                fontSize: 10,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  if (widget.recurring &&
+                      constraints.maxHeight >= 22 &&
+                      constraints.maxWidth >= 52)
+                    Positioned(
+                      top: 0,
+                      right: 0,
+                      child: Icon(
+                        Icons.repeat_rounded,
+                        size: 11,
+                        color: Colors.white.withValues(alpha: 0.92),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
       ),
     );
   }

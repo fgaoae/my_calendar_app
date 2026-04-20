@@ -15,6 +15,7 @@ class DateHelper {
       lastDate: DateTime(2100),
     );
     if (d == null) return null;
+    if (!context.mounted) return null;
     final t = await showTimePicker(
       context: context,
       initialTime: TimeOfDay.fromDateTime(base),

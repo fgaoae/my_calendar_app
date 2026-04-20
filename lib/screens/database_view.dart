@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_animate/flutter_animate.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../constants.dart';
+import '../theme/airy_theme.dart';
 import '../utils/date_helpers.dart';
 import '../utils/rrule_builder.dart';
+import '../widgets/airy_components.dart';
 
 class DatabaseViewWidget extends StatefulWidget {
   final Stream<List<Map<String, dynamic>>> eventStream;
@@ -29,9 +32,13 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
   List<Map<String, dynamic>> _dbs = [];
   List<Map<String, dynamic>> _events = [];
   bool _loading = true;
+  bool _isRefreshing = false;
+  int _refreshTasks = 0;
 
   List<Map<String, dynamic>>? _localRows;
   bool _isReordering = false;
+  String? _hoveredRowId;
+  String? _hoveredSidebarDbId;
 
   final Set<String> _selectedEventIds = {};
   final ScrollController _hCtrl = ScrollController();
@@ -104,42 +111,68 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     super.dispose();
   }
 
+  void _startRefresh() {
+    _refreshTasks += 1;
+    if (!_isRefreshing && mounted) {
+      setState(() => _isRefreshing = true);
+    }
+  }
+
+  void _endRefresh() {
+    if (_refreshTasks > 0) {
+      _refreshTasks -= 1;
+    }
+    if (_refreshTasks == 0 && _isRefreshing && mounted) {
+      setState(() => _isRefreshing = false);
+    }
+  }
+
   Future<void> _reloadAll() async {
-    setState(() => _loading = true);
-    final dbs = await Supabase.instance.client
-        .from('databases')
-        .select()
-        .order('created_at');
-    final ev = await Supabase.instance.client
-        .from('events')
-        .select()
-        .order('sort_order');
-    if (!mounted) return;
-    setState(() {
-      _dbs = List<Map<String, dynamic>>.from(dbs)
-          .where(
-            (d) => d['name']?.toString() != kHiddenDatabaseName,
-          )
-          .toList();
-      _events = List<Map<String, dynamic>>.from(ev);
-      if (_dbs.isNotEmpty) _selectedDbId ??= _dbs.first['id'].toString();
-      _loading = false;
-      _localRows = null;
-      _isReordering = false;
-    });
+    _startRefresh();
+    try {
+      setState(() => _loading = true);
+      final dbs = await Supabase.instance.client
+          .from('databases')
+          .select()
+          .order('created_at');
+      final ev = await Supabase.instance.client
+          .from('events')
+          .select()
+          .order('sort_order');
+      if (!mounted) return;
+      setState(() {
+        _dbs = List<Map<String, dynamic>>.from(dbs)
+            .where(
+              (d) => d['name']?.toString() != kHiddenDatabaseName,
+            )
+            .toList();
+        _events = List<Map<String, dynamic>>.from(ev);
+        if (_dbs.isNotEmpty) _selectedDbId ??= _dbs.first['id'].toString();
+        _loading = false;
+        _localRows = null;
+        _isReordering = false;
+      });
+    } finally {
+      _endRefresh();
+    }
   }
 
   Future<void> _fetchEventsNow() async {
-    final fresh = await Supabase.instance.client
-        .from('events')
-        .select()
-        .order('sort_order');
-    if (!mounted) return;
-    setState(() {
-      _events = List<Map<String, dynamic>>.from(fresh);
-      _localRows = null;
-      _isReordering = false;
-    });
+    _startRefresh();
+    try {
+      final fresh = await Supabase.instance.client
+          .from('events')
+          .select()
+          .order('sort_order');
+      if (!mounted) return;
+      setState(() {
+        _events = List<Map<String, dynamic>>.from(fresh);
+        _localRows = null;
+        _isReordering = false;
+      });
+    } finally {
+      _endRefresh();
+    }
   }
 
   Future<void> _afterEventWrite() async {
@@ -148,6 +181,21 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       if (!mounted) return;
       unawaited(_fetchEventsNow());
     });
+  }
+
+  Widget _buildAnimatedDialog(Widget child) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.94, end: 1),
+      duration: AiryTheme.medium,
+      curve: Curves.easeOutCubic,
+      builder: (context, value, _) {
+        final opacity = ((value - 0.94) / 0.06).clamp(0.0, 1.0);
+        return Opacity(
+          opacity: opacity,
+          child: Transform.scale(scale: value, child: child),
+        );
+      },
+    );
   }
 
   Map<String, dynamic> get _currentDb {
@@ -206,6 +254,10 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     }
   }
 
+  Color _databaseColor(String? dbId) {
+    return AiryPalette.databaseAccentForId(dbId);
+  }
+
   String _repeatLabel(Map<String, dynamic> props) {
     final r = props['_sys_rrule']?.toString();
     if (r == null || r.isEmpty) return '';
@@ -245,34 +297,36 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     final c = TextEditingController();
     await showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('新建数据库'),
-        content: TextField(
-          controller: c,
-          decoration: const InputDecoration(labelText: '数据库名称'),
+      builder: (_) => _buildAnimatedDialog(
+        AlertDialog(
+          title: const Text('新建数据库'),
+          content: TextField(
+            controller: c,
+            decoration: const InputDecoration(labelText: '数据库名称'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final name = c.text.trim();
+                if (name.isEmpty) return;
+                await Supabase.instance.client.from('databases').insert({
+                  'name': name,
+                  'schema': [],
+                  'property_types': {},
+                  'tag_options': {},
+                });
+                if (!mounted) return;
+                Navigator.pop(context);
+                widget.requestSync();
+              },
+              child: const Text('创建'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final name = c.text.trim();
-              if (name.isEmpty) return;
-              await Supabase.instance.client.from('databases').insert({
-                'name': name,
-                'schema': [],
-                'property_types': {},
-                'tag_options': {},
-              });
-              if (!mounted) return;
-              Navigator.pop(context);
-              widget.requestSync();
-            },
-            child: const Text('创建'),
-          ),
-        ],
       ),
     );
   }
@@ -281,32 +335,34 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     final c = TextEditingController(text: db['name']?.toString() ?? '');
     await showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('重命名数据库'),
-        content: TextField(
-          controller: c,
-          decoration: const InputDecoration(labelText: '新名称'),
+      builder: (_) => _buildAnimatedDialog(
+        AlertDialog(
+          title: const Text('重命名数据库'),
+          content: TextField(
+            controller: c,
+            decoration: const InputDecoration(labelText: '新名称'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final name = c.text.trim();
+                if (name.isEmpty) return;
+                await Supabase.instance.client
+                    .from('databases')
+                    .update({'name': name})
+                    .eq('id', db['id']);
+                if (!mounted) return;
+                Navigator.pop(context);
+                widget.requestSync();
+              },
+              child: const Text('保存'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final name = c.text.trim();
-              if (name.isEmpty) return;
-              await Supabase.instance.client
-                  .from('databases')
-                  .update({'name': name})
-                  .eq('id', db['id']);
-              if (!mounted) return;
-              Navigator.pop(context);
-              widget.requestSync();
-            },
-            child: const Text('保存'),
-          ),
-        ],
       ),
     );
   }
@@ -314,19 +370,22 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
   Future<void> _deleteDatabase(Map<String, dynamic> db) async {
     final ok = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('删除数据库'),
-        content: Text('确认删除 "${db['name']}"？将同时删除该数据库下所有数据。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('删除'),
-          ),
-        ],
+      builder: (_) => _buildAnimatedDialog(
+        AlertDialog(
+          title: const Text('删除数据库'),
+          content: Text('确认删除 "${db['name']}"？将同时删除该数据库下所有数据。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: AiryPalette.danger),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
       ),
     );
     if (ok != true) return;
@@ -360,7 +419,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     await showDialog(
       context: context,
       builder: (_) => StatefulBuilder(
-        builder: (_, setD) => AlertDialog(
+        builder: (_, setD) => _buildAnimatedDialog(
+          AlertDialog(
           title: const Text('新增属性'),
           content: SizedBox(
             width: 500,
@@ -440,7 +500,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                                     vertical: 4,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: Colors.deepPurple.withValues(alpha: 0.1),
+                                    color: AiryPalette.accent.withValues(alpha: 0.1),
                                     borderRadius: BorderRadius.circular(12),
                                   ),
                                   child: Row(
@@ -521,6 +581,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
             ),
           ],
         ),
+        ),
       ),
     );
     nameCtrl.dispose();
@@ -534,7 +595,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     await showDialog(
       context: context,
       builder: (_) => StatefulBuilder(
-        builder: (_, setD) => AlertDialog(
+        builder: (_, setD) => _buildAnimatedDialog(
+          AlertDialog(
           title: Text('编辑标签选项：$key'),
           content: SizedBox(
             width: 400,
@@ -586,7 +648,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                               vertical: 6,
                             ),
                             decoration: BoxDecoration(
-                              color: Colors.deepPurple.withValues(alpha: 0.1),
+                              color: AiryPalette.accent.withValues(alpha: 0.1),
                               borderRadius: BorderRadius.circular(14),
                             ),
                             child: Row(
@@ -662,6 +724,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
             ),
           ],
         ),
+        ),
       ),
     );
     newTagCtrl.dispose();
@@ -670,19 +733,22 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
   Future<void> _deleteProperty(String key) async {
     final ok = await showDialog<bool>(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('删除属性'),
-        content: Text('确认删除属性"$key"？会清除该列所有数据。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('删除'),
-          ),
-        ],
+      builder: (_) => _buildAnimatedDialog(
+        AlertDialog(
+          title: const Text('删除属性'),
+          content: Text('确认删除属性"$key"？会清除该列所有数据。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: AiryPalette.danger),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
       ),
     );
     if (ok != true) return;
@@ -793,9 +859,10 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
             .eq('id', current[i]['id']);
       }
     } finally {
-      if (!mounted) return;
-      setState(() => _isReordering = false);
-      widget.requestSync();
+      if (mounted) {
+        setState(() => _isReordering = false);
+        widget.requestSync();
+      }
     }
   }
 
@@ -803,39 +870,41 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     final c = TextEditingController(text: row['title']?.toString() ?? '');
     await showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('修改名称'),
-        content: TextField(controller: c, autofocus: true),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final newTitle = c.text.trim();
-              final id = row['id']?.toString();
-              if (id != null && id.isNotEmpty) {
-                _patchLocalEventById(id, {'title': newTitle});
-              }
-
-              try {
-                await Supabase.instance.client
-                    .from('events')
-                    .update({'title': newTitle})
-                    .eq('id', row['id']);
-              } catch (_) {
+      builder: (_) => _buildAnimatedDialog(
+        AlertDialog(
+          title: const Text('修改名称'),
+          content: TextField(controller: c, autofocus: true),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final newTitle = c.text.trim();
+                final id = row['id']?.toString();
                 if (id != null && id.isNotEmpty) {
-                  await _fetchEventsNow();
+                  _patchLocalEventById(id, {'title': newTitle});
                 }
-              }
-              if (!mounted) return;
-              Navigator.pop(context);
-              widget.requestSync();
-            },
-            child: const Text('保存'),
-          ),
-        ],
+
+                try {
+                  await Supabase.instance.client
+                      .from('events')
+                      .update({'title': newTitle})
+                      .eq('id', row['id']);
+                } catch (_) {
+                  if (id != null && id.isNotEmpty) {
+                    await _fetchEventsNow();
+                  }
+                }
+                if (!mounted) return;
+                Navigator.pop(context);
+                widget.requestSync();
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -875,6 +944,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
         : null;
     final dt = await DateHelper.pickDateThenTime(context, oldEnd ?? oldStart ?? DateTime.now());
     if (dt == null) return;
+    if (!mounted) return;
 
     if (oldStart != null && dt.isBefore(oldStart)) {
       ScaffoldMessenger.of(
@@ -906,56 +976,58 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     String value = (row['properties']?['_sys_reminder']?.toString() ?? 'NONE');
     await showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('提醒'),
-        content: StatefulBuilder(
-          builder: (_, s) => DropdownButton<String>(
-            value: value,
-            isExpanded: true,
-            items: const [
-              DropdownMenuItem(value: 'NONE', child: Text('不提醒')),
-              DropdownMenuItem(value: '5MIN', child: Text('提前5分钟')),
-              DropdownMenuItem(value: '15MIN', child: Text('提前15分钟')),
-              DropdownMenuItem(value: '1HOUR', child: Text('提前1小时')),
-            ],
-            onChanged: (v) => s(() => value = v ?? 'NONE'),
+      builder: (_) => _buildAnimatedDialog(
+        AlertDialog(
+          title: const Text('提醒'),
+          content: StatefulBuilder(
+            builder: (_, s) => DropdownButton<String>(
+              value: value,
+              isExpanded: true,
+              items: const [
+                DropdownMenuItem(value: 'NONE', child: Text('不提醒')),
+                DropdownMenuItem(value: '5MIN', child: Text('提前5分钟')),
+                DropdownMenuItem(value: '15MIN', child: Text('提前15分钟')),
+                DropdownMenuItem(value: '1HOUR', child: Text('提前1小时')),
+              ],
+              onChanged: (v) => s(() => value = v ?? 'NONE'),
+            ),
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final props = Map<String, dynamic>.from(row['properties'] ?? {});
-              if (value == 'NONE') {
-                props.remove('_sys_reminder');
-              } else {
-                props['_sys_reminder'] = value;
-              }
-              final id = row['id']?.toString();
-              if (id != null && id.isNotEmpty) {
-                _patchLocalEventById(id, {'properties': props});
-              }
-
-              try {
-                await Supabase.instance.client
-                    .from('events')
-                    .update({'properties': props})
-                    .eq('id', row['id']);
-              } catch (_) {
-                if (id != null && id.isNotEmpty) {
-                  await _fetchEventsNow();
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final props = Map<String, dynamic>.from(row['properties'] ?? {});
+                if (value == 'NONE') {
+                  props.remove('_sys_reminder');
+                } else {
+                  props['_sys_reminder'] = value;
                 }
-              }
-              if (!mounted) return;
-              Navigator.pop(context);
-              widget.requestSync();
-            },
-            child: const Text('保存'),
-          ),
-        ],
+                final id = row['id']?.toString();
+                if (id != null && id.isNotEmpty) {
+                  _patchLocalEventById(id, {'properties': props});
+                }
+
+                try {
+                  await Supabase.instance.client
+                      .from('events')
+                      .update({'properties': props})
+                      .eq('id', row['id']);
+                } catch (_) {
+                  if (id != null && id.isNotEmpty) {
+                    await _fetchEventsNow();
+                  }
+                }
+                if (!mounted) return;
+                Navigator.pop(context);
+                widget.requestSync();
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -989,7 +1061,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     await showDialog(
       context: context,
       builder: (_) => StatefulBuilder(
-        builder: (_, setD) => AlertDialog(
+        builder: (_, setD) => _buildAnimatedDialog(
+          AlertDialog(
           title: const Text('重复设置'),
           content: Column(
             mainAxisSize: MainAxisSize.min,
@@ -1088,6 +1161,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
             ),
           ],
         ),
+        ),
       ),
     );
   }
@@ -1128,7 +1202,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
       await showDialog(
         context: context,
         builder: (_) => StatefulBuilder(
-          builder: (_, setD) => AlertDialog(
+          builder: (_, setD) => _buildAnimatedDialog(
+            AlertDialog(
             title: Text('为 $key 选择标签'),
             content: SizedBox(
               width: 400,
@@ -1169,11 +1244,11 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                                 ),
                                 decoration: BoxDecoration(
                                   color: isSelected
-                                      ? Colors.deepPurple.withValues(alpha: 0.15)
+                                      ? AiryPalette.accent.withValues(alpha: 0.15)
                                       : Colors.transparent,
                                   border: isSelected
                                       ? Border.all(
-                                          color: Colors.deepPurple,
+                                          color: AiryPalette.accent,
                                           width: 2,
                                         )
                                       : Border.all(
@@ -1191,15 +1266,15 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                                               ? FontWeight.bold
                                               : FontWeight.normal,
                                           color: isSelected
-                                              ? Colors.deepPurple
-                                              : Colors.black,
+                                              ? AiryPalette.accent
+                                              : AiryPalette.textPrimary,
                                         ),
                                       ),
                                     ),
                                     if (isSelected)
                                       const Icon(
                                         Icons.check,
-                                        color: Colors.deepPurple,
+                                        color: AiryPalette.accent,
                                         size: 20,
                                       ),
                                   ],
@@ -1304,6 +1379,7 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
               ),
             ],
           ),
+          ),
         ),
       );
       return;
@@ -1314,45 +1390,47 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
     );
     await showDialog(
       context: context,
-      builder: (_) => AlertDialog(
-        title: Text('编辑属性：$key'),
-        content: TextField(controller: c, autofocus: true),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final props = Map<String, dynamic>.from(row['properties'] ?? {});
-              final v = c.text.trim();
-              if (v.isEmpty) {
-                props.remove(key);
-              } else {
-                props[key] = v;
-              }
-              final id = row['id']?.toString();
-              if (id != null && id.isNotEmpty) {
-                _patchLocalEventById(id, {'properties': props});
-              }
-
-              try {
-                await Supabase.instance.client
-                    .from('events')
-                    .update({'properties': props})
-                    .eq('id', row['id']);
-              } catch (_) {
-                if (id != null && id.isNotEmpty) {
-                  await _fetchEventsNow();
+      builder: (_) => _buildAnimatedDialog(
+        AlertDialog(
+          title: Text('编辑属性：$key'),
+          content: TextField(controller: c, autofocus: true),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final props = Map<String, dynamic>.from(row['properties'] ?? {});
+                final v = c.text.trim();
+                if (v.isEmpty) {
+                  props.remove(key);
+                } else {
+                  props[key] = v;
                 }
-              }
-              if (!mounted) return;
-              Navigator.pop(context);
-              widget.requestSync();
-            },
-            child: const Text('保存'),
-          ),
-        ],
+                final id = row['id']?.toString();
+                if (id != null && id.isNotEmpty) {
+                  _patchLocalEventById(id, {'properties': props});
+                }
+
+                try {
+                  await Supabase.instance.client
+                      .from('events')
+                      .update({'properties': props})
+                      .eq('id', row['id']);
+                } catch (_) {
+                  if (id != null && id.isNotEmpty) {
+                    await _fetchEventsNow();
+                  }
+                }
+                if (!mounted) return;
+                Navigator.pop(context);
+                widget.requestSync();
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1395,26 +1473,32 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
             padding: const EdgeInsets.symmetric(horizontal: 8),
             alignment: Alignment.centerLeft,
             decoration: BoxDecoration(
-              color: Colors.grey.shade100,
-              border: Border(right: BorderSide(color: Colors.grey.shade300)),
+              color: AiryPalette.panelTint.withValues(alpha: 0.95),
+              border: Border(
+                right: BorderSide(color: AiryPalette.border.withValues(alpha: 0.9)),
+              ),
             ),
             child: Row(
               children: [
                 Expanded(
                   child: Text(
                     label,
-                    style: const TextStyle(fontWeight: FontWeight.w600),
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 12,
+                      color: AiryPalette.textSecondary,
+                    ),
                   ),
                 ),
                 if (editable)
                   InkWell(
                     onTap: onEdit,
-                    child: const Icon(Icons.edit, size: 16, color: Colors.blue),
+                    child: const Icon(Icons.edit, size: 16, color: AiryPalette.accent),
                   ),
                 if (deletable)
                   InkWell(
                     onTap: onDelete,
-                    child: const Icon(Icons.close, size: 16, color: Colors.red),
+                    child: const Icon(Icons.close, size: 16, color: AiryPalette.danger),
                   ),
               ],
             ),
@@ -1455,11 +1539,15 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
         padding: const EdgeInsets.symmetric(horizontal: 8),
         decoration: BoxDecoration(
           border: Border(
-            right: BorderSide(color: Colors.grey.shade200),
-            bottom: BorderSide(color: Colors.grey.shade200),
+            right: BorderSide(color: AiryPalette.border.withValues(alpha: 0.85)),
+            bottom: BorderSide(color: AiryPalette.border.withValues(alpha: 0.85)),
           ),
         ),
-        child: Text(text, overflow: TextOverflow.ellipsis),
+        child: Text(
+          text,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: AiryPalette.textPrimary),
+        ),
       ),
     );
   }
@@ -1480,8 +1568,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
         alignment: Alignment.center,
         decoration: BoxDecoration(
           border: Border(
-            right: BorderSide(color: Colors.grey.shade200),
-            bottom: BorderSide(color: Colors.grey.shade200),
+            right: BorderSide(color: AiryPalette.border.withValues(alpha: 0.85)),
+            bottom: BorderSide(color: AiryPalette.border.withValues(alpha: 0.85)),
           ),
         ),
         child: Checkbox(
@@ -1502,8 +1590,8 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
           padding: const EdgeInsets.symmetric(horizontal: 8),
           decoration: BoxDecoration(
             border: Border(
-              right: BorderSide(color: Colors.grey.shade200),
-              bottom: BorderSide(color: Colors.grey.shade200),
+              right: BorderSide(color: AiryPalette.border.withValues(alpha: 0.85)),
+              bottom: BorderSide(color: AiryPalette.border.withValues(alpha: 0.85)),
             ),
           ),
           child: v.isEmpty
@@ -1514,10 +1602,13 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
                     vertical: 3,
                   ),
                   decoration: BoxDecoration(
-                    color: Colors.deepPurple.withValues(alpha: 0.12),
+                    color: AiryPalette.accent.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: Text(v, style: const TextStyle(fontSize: 12)),
+                  child: Text(
+                    v,
+                    style: const TextStyle(fontSize: 12, color: AiryPalette.accent),
+                  ),
                 ),
         ),
       );
@@ -1533,151 +1624,235 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
   Widget _buildRow(Map<String, dynamic> r, int i, List<String> schema) {
     final id = r['id'].toString();
     final props = Map<String, dynamic>.from(r['properties'] ?? {});
-    return Container(
-      key: ValueKey(id),
-      color: i.isEven ? Colors.white : Colors.grey.shade50,
-      child: Row(
-        children: [
-          SizedBox(
-            width: 42,
-            child: Checkbox(
-              value: _selectedEventIds.contains(id),
-              onChanged: (v) {
-                setState(() {
-                  if (v == true) {
-                    _selectedEventIds.add(id);
-                  } else {
-                    _selectedEventIds.remove(id);
-                  }
-                });
-              },
+    final selected = _selectedEventIds.contains(id);
+    final hovered = _hoveredRowId == id;
+    return MouseRegion(
+      key: ValueKey('row-$id'),
+      onEnter: (_) {
+        if (_hoveredRowId != id) {
+          setState(() => _hoveredRowId = id);
+        }
+      },
+      onExit: (_) {
+        if (_hoveredRowId == id) {
+          setState(() => _hoveredRowId = null);
+        }
+      },
+      child: AnimatedContainer(
+        duration: AiryTheme.quick,
+        curve: Curves.easeOutCubic,
+        key: ValueKey(id),
+        color: selected
+            ? AiryPalette.accentSoft.withValues(alpha: 0.62)
+            : (hovered
+                  ? AiryPalette.panelTint.withValues(alpha: 0.8)
+                  : (i.isEven
+                        ? AiryPalette.panel.withValues(alpha: 0.76)
+                        : AiryPalette.panelTint.withValues(alpha: 0.6))),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 42,
+              child: Checkbox(
+                value: _selectedEventIds.contains(id),
+                onChanged: (v) {
+                  setState(() {
+                    if (v == true) {
+                      _selectedEventIds.add(id);
+                    } else {
+                      _selectedEventIds.remove(id);
+                    }
+                  });
+                },
+              ),
             ),
-          ),
-          ReorderableDragStartListener(
-            index: i,
-            child: const SizedBox(
-              width: 34,
-              child: Icon(Icons.drag_indicator, size: 18),
+            ReorderableDragStartListener(
+              index: i,
+              child: const SizedBox(
+                width: 34,
+                child: Icon(Icons.drag_indicator, size: 18, color: AiryPalette.accent),
+              ),
             ),
-          ),
-          _cell(
-            text: (r['title'] ?? '').toString(),
-            width: _colWidths['title']!,
-            onTap: () => _editTitle(r),
-          ),
-          _cell(
-            text: _fmt(r['start_time']),
-            width: _colWidths['start']!,
-            onTap: () => _editStartTime(r),
-          ),
-          _cell(
-            text: _fmt(r['end_time']),
-            width: _colWidths['end']!,
-            onTap: () => _editEndTime(r),
-          ),
-          _cell(
-            text: _repeatLabel(props),
-            width: _colWidths['repeat']!,
-            onTap: () => _editRepeat(r),
-          ),
-          _cell(
-            text: _remindLabel(props),
-            width: _colWidths['remind']!,
-            onTap: () => _editReminder(r),
-          ),
-          for (final k in schema)
-            _buildCustomPropertyCell(r, k, _colWidths['prop_$k'] ?? 140),
-          SizedBox(
-            width: 44,
-            child: IconButton(
-              icon: const Icon(Icons.delete_outline, color: Colors.red),
-              onPressed: () => _deleteOneRow(id),
+            _cell(
+              text: (r['title'] ?? '').toString(),
+              width: _colWidths['title']!,
+              onTap: () => _editTitle(r),
             ),
-          ),
-        ],
+            _cell(
+              text: _fmt(r['start_time']),
+              width: _colWidths['start']!,
+              onTap: () => _editStartTime(r),
+            ),
+            _cell(
+              text: _fmt(r['end_time']),
+              width: _colWidths['end']!,
+              onTap: () => _editEndTime(r),
+            ),
+            _cell(
+              text: _repeatLabel(props),
+              width: _colWidths['repeat']!,
+              onTap: () => _editRepeat(r),
+            ),
+            _cell(
+              text: _remindLabel(props),
+              width: _colWidths['remind']!,
+              onTap: () => _editReminder(r),
+            ),
+            for (final k in schema)
+              _buildCustomPropertyCell(r, k, _colWidths['prop_$k'] ?? 140),
+            SizedBox(
+              width: 44,
+              child: IconButton(
+                icon: const Icon(Icons.delete_outline, color: AiryPalette.danger),
+                onPressed: () => _deleteOneRow(id),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildSidebar() {
-    return Container(
-      width: 250,
-      decoration: BoxDecoration(
-        color: Colors.grey.shade50,
-        border: Border(right: BorderSide(color: Colors.grey.shade300)),
-      ),
-      child: Column(
-        children: [
-          ListTile(
-            title: const Text(
-              '数据库',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            trailing: IconButton(
-              icon: const Icon(Icons.add),
-              onPressed: _createDatabase,
-              tooltip: '新建数据库',
-            ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: _dbs.isEmpty
-                ? const Center(child: Text('暂无数据库'))
-                : ListView.builder(
-                    itemCount: _dbs.length,
-                    itemBuilder: (_, i) {
-                      final db = _dbs[i];
-                      final id = db['id'].toString();
-                      final selected = id == _selectedDbId;
-                      return Material(
-                        color: selected
-                            ? Colors.deepPurple.withValues(alpha: 0.08)
-                            : Colors.transparent,
-                        child: ListTile(
-                          dense: true,
-                          title: Text(
-                            db['name']?.toString() ?? '未命名',
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontWeight: selected
-                                  ? FontWeight.w700
-                                  : FontWeight.w500,
-                            ),
-                          ),
-                          onTap: () {
-                            setState(() {
-                              _selectedDbId = id;
-                              _localRows = null;
-                              _isReordering = false;
-                            });
-                          },
-                          trailing: PopupMenuButton<String>(
-                            onSelected: (v) {
-                              if (v == 'rename') _renameDatabase(db);
-                              if (v == 'delete') _deleteDatabase(db);
-                            },
-                            itemBuilder: (_) => const [
-                              PopupMenuItem(
-                                value: 'rename',
-                                child: Text('重命名'),
+    return SizedBox(
+      width: 260,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 8, 12),
+        child: AiryPanel(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+          child: Column(
+            children: [
+              ListTile(
+                dense: true,
+                title: const Text(
+                  '数据库',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+                trailing: IconButton(
+                  icon: const Icon(Icons.add, color: AiryPalette.accent),
+                  onPressed: _createDatabase,
+                  tooltip: '新建数据库',
+                ),
+              ),
+              Divider(height: 1, color: AiryPalette.border.withValues(alpha: 0.9)),
+              Expanded(
+                child: _dbs.isEmpty
+                    ? const Center(child: Text('暂无数据库'))
+                    : ListView.builder(
+                        itemCount: _dbs.length,
+                        itemBuilder: (_, i) {
+                          final db = _dbs[i];
+                          final id = db['id'].toString();
+                          final selected = id == _selectedDbId;
+                          final hovered = _hoveredSidebarDbId == id;
+                          final dbColor = _databaseColor(id);
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 8),
+                            child: MouseRegion(
+                              onEnter: (_) {
+                                if (_hoveredSidebarDbId != id) {
+                                  setState(() => _hoveredSidebarDbId = id);
+                                }
+                              },
+                              onExit: (_) {
+                                if (_hoveredSidebarDbId == id) {
+                                  setState(() => _hoveredSidebarDbId = null);
+                                }
+                              },
+                              child: AnimatedContainer(
+                                duration: AiryTheme.quick,
+                                curve: Curves.easeOutCubic,
+                                decoration: BoxDecoration(
+                                  color: selected
+                                      ? dbColor.withValues(alpha: 0.2)
+                                      : (hovered
+                                            ? dbColor.withValues(alpha: 0.09)
+                                            : Colors.transparent),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: selected
+                                        ? dbColor.withValues(alpha: 0.44)
+                                        : Colors.transparent,
+                                  ),
+                                ),
+                                child: ListTile(
+                                  dense: true,
+                                  leading: AnimatedContainer(
+                                    duration: AiryTheme.quick,
+                                    curve: Curves.easeOutCubic,
+                                    width: selected ? 10 : 8,
+                                    height: selected ? 10 : 8,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: dbColor.withValues(
+                                        alpha: selected ? 1 : (hovered ? 0.85 : 0.68),
+                                      ),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: dbColor.withValues(alpha: 0.26),
+                                          blurRadius: selected ? 8 : 5,
+                                          offset: const Offset(0, 2),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  title: Text(
+                                    db['name']?.toString() ?? '未命名',
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: selected
+                                          ? AiryPalette.textPrimary
+                                          : AiryPalette.textSecondary,
+                                      fontWeight: selected
+                                          ? FontWeight.w700
+                                          : FontWeight.w600,
+                                    ),
+                                  ),
+                                  onTap: () {
+                                    setState(() {
+                                      _selectedDbId = id;
+                                      _localRows = null;
+                                      _isReordering = false;
+                                    });
+                                  },
+                                  trailing: PopupMenuButton<String>(
+                                    onSelected: (v) {
+                                      if (v == 'rename') _renameDatabase(db);
+                                      if (v == 'delete') _deleteDatabase(db);
+                                    },
+                                    itemBuilder: (_) => const [
+                                      PopupMenuItem(
+                                        value: 'rename',
+                                        child: Text('重命名'),
+                                      ),
+                                      PopupMenuItem(value: 'delete', child: Text('删除')),
+                                    ],
+                                  ),
+                                ),
                               ),
-                              PopupMenuItem(value: 'delete', child: Text('删除')),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
+                            )
+                                .animate(delay: (80 + i * 35).ms)
+                                .fadeIn(duration: 300.ms)
+                                .slideX(begin: -0.04, end: 0, duration: 300.ms),
+                          );
+                        },
+                      ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_loading)
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (_loading) {
+      return const Scaffold(
+        backgroundColor: Colors.transparent,
+        body: AiryBackground(child: Center(child: CircularProgressIndicator())),
+      );
+    }
 
     final rows = _rows;
     final schema = _schema;
@@ -1698,10 +1873,21 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
         44;
 
     return Scaffold(
+      backgroundColor: Colors.transparent,
       appBar: AppBar(
         title: const Text('数据库'),
         actions: [
-          IconButton(onPressed: _reloadAll, icon: const Icon(Icons.sync)),
+          AirySyncStatus(
+            isSyncing: _isRefreshing,
+            keyPrefix: 'database',
+          ),
+          AirySyncButton(
+            isSyncing: _isRefreshing,
+            keyPrefix: 'database',
+            onPressed: () {
+              unawaited(_reloadAll());
+            },
+          ),
           if (_selectedEventIds.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(right: 12),
@@ -1713,93 +1899,113 @@ class _DatabaseViewWidgetState extends State<DatabaseViewWidget> {
             ),
         ],
       ),
-      body: Row(
-        children: [
-          _buildSidebar(),
-          Expanded(
-            child: _selectedDbId == null
-                ? const Center(child: Text('请先在左侧新建并选择数据库'))
-                : Column(
-                    children: [
-                      Expanded(
-                        child: SingleChildScrollView(
-                          controller: _hCtrl,
-                          scrollDirection: Axis.horizontal,
-                          child: SizedBox(
-                            width: totalWidth,
-                            child: Column(
-                              children: [
-                                Row(
-                                  children: [
-                                    const SizedBox(width: 42),
-                                    const SizedBox(width: 34),
-                                    _headCell('title', '名称'),
-                                    _headCell('start', '开始时间'),
-                                    _headCell('end', '结束时间'),
-                                    _headCell('repeat', '重复'),
-                                    _headCell('remind', '提醒'),
-                                    for (final k in schema)
-                                      _headCell(
-                                        'prop_$k',
-                                        '$k (${_propertyTypes[k] ?? 'text'})',
-                                        deletable: true,
-                                        editable: _propertyTypes[k]?.toString() == 'tag',
-                                        onDelete: () => _deleteProperty(k),
-                                        onEdit: _propertyTypes[k]?.toString() == 'tag' ? () => _editPropertyTags(k) : null,
+      body: AiryBackground(
+        child: Row(
+          children: [
+            _buildSidebar(),
+            Expanded(
+              child: _selectedDbId == null
+                  ? const Center(child: Text('请先在左侧新建并选择数据库'))
+                  : Padding(
+                      padding: const EdgeInsets.fromLTRB(4, 8, 12, 12),
+                      child: AiryPanel(
+                        padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                        child: Column(
+                          children: [
+                            AnimatedContainer(
+                              duration: AiryTheme.quick,
+                              curve: Curves.easeOutCubic,
+                              height: _isRefreshing ? 3 : 0,
+                              margin: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(999),
+                                child: const LinearProgressIndicator(
+                                  backgroundColor: AiryPalette.accentSoft,
+                                  color: AiryPalette.accent,
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              child: SingleChildScrollView(
+                                controller: _hCtrl,
+                                scrollDirection: Axis.horizontal,
+                                child: SizedBox(
+                                  width: totalWidth,
+                                  child: Column(
+                                    children: [
+                                      Row(
+                                        children: [
+                                          const SizedBox(width: 42),
+                                          const SizedBox(width: 34),
+                                          _headCell('title', '名称'),
+                                          _headCell('start', '开始时间'),
+                                          _headCell('end', '结束时间'),
+                                          _headCell('repeat', '重复'),
+                                          _headCell('remind', '提醒'),
+                                          for (final k in schema)
+                                            _headCell(
+                                              'prop_$k',
+                                              '$k (${_propertyTypes[k] ?? 'text'})',
+                                              deletable: true,
+                                              editable: _propertyTypes[k]?.toString() == 'tag',
+                                              onDelete: () => _deleteProperty(k),
+                                              onEdit: _propertyTypes[k]?.toString() == 'tag' ? () => _editPropertyTags(k) : null,
+                                            ),
+                                          Container(
+                                            width: 56,
+                                            height: 42,
+                                            alignment: Alignment.center,
+                                            decoration: BoxDecoration(
+                                              color: AiryPalette.panelTint.withValues(alpha: 0.95),
+                                              border: Border(
+                                                right: BorderSide(
+                                                  color: AiryPalette.border.withValues(alpha: 0.9),
+                                                ),
+                                              ),
+                                            ),
+                                            child: IconButton(
+                                              icon: const Icon(Icons.add, size: 18, color: AiryPalette.accent),
+                                              onPressed: _addPropertyFromHeaderPlus,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 44),
+                                        ],
                                       ),
-                                    Container(
-                                      width: 56,
-                                      height: 42,
-                                      alignment: Alignment.center,
-                                      decoration: BoxDecoration(
-                                        color: Colors.grey.shade100,
-                                        border: Border(
-                                          right: BorderSide(
-                                            color: Colors.grey.shade300,
+                                      Expanded(
+                                        child: IgnorePointer(
+                                          ignoring: _isReordering,
+                                          child: ReorderableListView.builder(
+                                            itemCount: rows.length,
+                                            onReorder: _reorderRows,
+                                            buildDefaultDragHandles: false,
+                                            itemBuilder: (_, i) => _buildRow(rows[i], i, schema),
                                           ),
                                         ),
                                       ),
-                                      child: IconButton(
-                                        icon: const Icon(Icons.add, size: 18),
-                                        onPressed: _addPropertyFromHeaderPlus,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 44),
-                                  ],
-                                ),
-                                Expanded(
-                                  child: IgnorePointer(
-                                    ignoring: _isReordering,
-                                    child: ReorderableListView.builder(
-                                      itemCount: rows.length,
-                                      onReorder: _reorderRows,
-                                      buildDefaultDragHandles: false,
-                                      itemBuilder: (_, i) =>
-                                          _buildRow(rows[i], i, schema),
-                                    ),
+                                    ],
                                   ),
                                 ),
-                              ],
+                              ),
                             ),
-                          ),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(8),
+                              child: Align(
+                                alignment: Alignment.centerLeft,
+                                child: OutlinedButton.icon(
+                                  onPressed: _addRow,
+                                  icon: const Icon(Icons.add),
+                                  label: const Text('新增一行'),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                      ),
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(8),
-                        child: Align(
-                          alignment: Alignment.centerLeft,
-                          child: OutlinedButton.icon(
-                            onPressed: _addRow,
-                            icon: const Icon(Icons.add),
-                            label: const Text('新增一行'),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-          ),
-        ],
+                      ).animate().fadeIn(duration: 420.ms).slideY(begin: 0.03, end: 0),
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -36,6 +36,8 @@ dependencies:
   cupertino_icons: ^1.0.8
   supabase_flutter: ^2.12.4
   syncfusion_flutter_calendar: ^33.1.49
+  flutter_animate: ^4.5.0
+  google_fonts: ^6.2.1
 
 dev_dependencies:
   flutter_test:
